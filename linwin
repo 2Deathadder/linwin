@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 2Deathadder — https://github.com/2Deathadder/linwin
-# linwin v1 — installe Windows 10 en dual-boot natif depuis Linux, sans clé USB.
+# linwin v1.1 — installe Windows 10 en dual-boot natif depuis Linux, sans clé USB.
 #
 # Principe : on trouve de la place sur le disque de la partition EFI — de l'espace
 # non alloué (n'importe quelle distribution, n'importe quel système de fichiers),
@@ -18,7 +18,7 @@
 # Étapes :  check → plan → iso → prepare → stage → boot → (installer Windows) → finish
 set -euo pipefail
 
-VERSION=1
+VERSION=1.1
 STATE_DIR=/var/lib/linwin
 STATE=$STATE_DIR/state
 MIB=2048                 # secteurs de 512 octets par Mio
@@ -646,7 +646,7 @@ save_state() {
   mkdir -p "$STATE_DIR"
   local k
   : >"$STATE.tmp"
-  for k in MODE DISK PART_NUM MSR_NUM WIN_NUM WIN_SETUP_ID STAGE_NUM MSR_START WIN_START STAGE_START STAGED UNATTENDED VMD_DRIVER NET_DRIVERS STAGE_PARTUUID LINUX_BOOT; do
+  for k in MODE DISK PART_NUM MSR_NUM WIN_NUM WIN_SETUP_ID STAGE_NUM MSR_START WIN_START STAGE_START STAGED UNATTENDED VMD_DRIVER NET_DRIVERS STAGE_PARTUUID LINUX_BOOT RESUME_TRIES; do
     # vide reste vide (STAGE_PARTUUID, LINUX_BOOT) : load_state pose les défauts
     printf '%s=%q\n' "$k" "${!k-}" >>"$STATE.tmp"
   done
@@ -655,7 +655,7 @@ save_state() {
 
 load_state() {
   [[ -f $STATE ]] || die "aucun état trouvé ($STATE) : lance d'abord « prepare »"
-  MODE=shrink WIN_SETUP_ID= MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  MODE=shrink WIN_SETUP_ID= MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID= RESUME_TRIES=0
   # shellcheck disable=SC1090
   source "$STATE"
 }
@@ -1035,7 +1035,7 @@ EOF
     "$STAGE_START") STAGE_NUM=$num ;;
     esac
   done < <(part_table "$DISK")
-  STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID= RESUME_TRIES=0
   LINUX_BOOT=$(boot_current)
   [[ $MSR_NUM =~ ^[0-9]+$ && $WIN_NUM =~ ^[0-9]+$ && $STAGE_NUM =~ ^[0-9]+$ ]] || die "numéros des nouvelles partitions illisibles"
   save_state
@@ -1555,6 +1555,8 @@ cmd_stage() {
 
   phase 3 4 "Outils nécessaires"
   for t in wimlib-imagex mkfs.fat; do ensure_tool "$t"; done
+  # « finish » lit l'état de l'installation sur la partition Windows
+  ensure_ntfs
 
   STAGED=0
   save_state
@@ -1868,13 +1870,152 @@ windows_installed() {
   [[ $(blkid -p -s TYPE -o value "$dev" 2>/dev/null || lsblk -dno FSTYPE "$dev" 2>/dev/null) == ntfs ]]
 }
 
+# --- partition Windows --------------------------------------------------------------
+
+pkg_ntfs3g() { [[ $(pkg_family 2>/dev/null) == gentoo ]] && echo sys-fs/ntfs3g || echo ntfs-3g; }
+
+# Vrai si ce Linux sait lire NTFS : pilote ntfs3 du noyau (5.15+), sinon ntfs-3g.
+# Certains noyaux (images cloud, noyaux allégés) n'ont pas ntfs3.
+ntfs_readable() {
+  grep -qw ntfs3 /proc/filesystems 2>/dev/null || modprobe -n -q ntfs3 2>/dev/null || command -v ntfs-3g >/dev/null
+}
+
+# Installe ntfs-3g si le noyau ne lit pas NTFS (root)
+ensure_ntfs() {
+  ntfs_readable && return 0
+  local fam
+  fam=$(pkg_family) || die "ce noyau ne lit pas NTFS et aucun gestionnaire de paquets n'est connu : installe ntfs-3g"
+  echo "Installation de ntfs-3g (ce noyau n'a pas le pilote ntfs3)…"
+  case $fam in
+  arch) pacman -S --needed --noconfirm ntfs-3g ;;
+  deb) DEBIAN_FRONTEND=noninteractive apt-get install -y ntfs-3g ;;
+  rpm) if command -v dnf >/dev/null; then dnf install -y ntfs-3g; else yum install -y ntfs-3g; fi ;;
+  suse) zypper --non-interactive install ntfs-3g ;;
+  void) xbps-install -Sy ntfs-3g ;;
+  alpine) apk add ntfs-3g ;;
+  gentoo) emerge --noreplace "$(pkg_ntfs3g)" ;;
+  esac >&2 || true
+  ntfs_readable || die "impossible d'installer ntfs-3g : installe-le à la main puis relance"
+}
+
+# mount_windows PÉRIPHÉRIQUE DOSSIER [ro] : ntfs3, sinon ntfs-3g. Échoue si Windows
+# n'a pas été fermé proprement (hibernation, démarrage rapide).
+mount_windows() {
+  local opt=${3:-rw}
+  mount -t ntfs3 -o "$opt" "$1" "$2" 2>/dev/null && return 0
+  command -v ntfs-3g >/dev/null && ntfs-3g -o "$opt" "$1" "$2" 2>/dev/null
+}
+
+# État de l'installation de Windows, lu dans Windows\Setup\State\State.ini :
+# COMPLETE quand elle est terminée, un autre état IMAGE_STATE_* (sans le préfixe)
+# pendant, vide si illisible. La partition en NTFS et l'entrée « Windows Boot
+# Manager » existent dès la PREMIÈRE phase : elles ne suffisent pas.
+windows_setup_state() {
+  local dev mnt ini st=""
+  dev=$(partdev "$DISK" "$WIN_NUM") || return 0
+  mnt=$(mktemp -d)
+  if mount_windows "$dev" "$mnt" ro; then
+    ini=$(find "$mnt" -maxdepth 4 -ipath "$mnt/windows/setup/state/state.ini" -print -quit 2>/dev/null)
+    [[ -n $ini ]] && st=$(tr -d '\0\r' <"$ini" | sed -n 's/^ImageState=//p' | head -1)
+    umount "$mnt" 2>/dev/null || true
+  fi
+  rmdir "$mnt" 2>/dev/null || true
+  echo "${st#IMAGE_STATE_}"
+}
+
+# Windows écrit dans son entrée UEFI le numéro de la partition EFI selon son RANG sur
+# le disque, alors que l'UEFI attend le numéro d'entrée GPT. Sur une table qui n'est
+# pas dans l'ordre du disque, un firmware strict juge l'entrée invalide et démarre
+# Linux à la place. On la recrée avec le bon numéro. Affiche l'entrée valable.
+fix_windows_boot_entry() {
+  local esp_num line num part data order keep="" keep_part="" keep_data="" bare=() tmp new
+  find_esp || return 1
+  esp_num=$(<"/sys/class/block/${ESP_DEV##*/}/partition")
+  # L'entrée de Windows porte ses « données facultatives » (« WINDOWS…BCDOBJECT={…} ») :
+  # c'est par elles que Windows la reconnaît comme {bootmgr} (bcdedit /addlast…). Une
+  # entrée sans ces données n'est pour lui qu'une application de plus.
+  while IFS= read -r line; do
+    num=$(sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p' <<<"$line")
+    part=$(sed -nE 's/.*HD\(([0-9]+),GPT.*/\1/p' <<<"$line")
+    data=$(sed -E 's/.*[Bb][Oo][Oo][Tt][Mm][Gg][Ff][Ww]\.[Ee][Ff][Ii]\)?//' <<<"$line")
+    if [[ $data =~ ^[0-9A-Fa-f]{16,}$ && -z $keep ]]; then
+      keep=$num keep_part=$part keep_data=$data
+    else
+      bare+=("$num")
+    fi
+  done < <(efibootmgr -v | grep -F "Windows Boot Manager")
+  if [[ -z $keep ]]; then
+    # pas de données lisibles (efibootmgr ancien) : on garde la première entrée telle quelle
+    ((${#bare[@]})) || return 1
+    keep=${bare[0]} bare=("${bare[@]:1}")
+    keep_part=$(efibootmgr -v | grep -i "^Boot$keep" | sed -nE 's/.*HD\(([0-9]+),GPT.*/\1/p')
+  fi
+  order=$(efibootmgr | awk -F': ' '/^BootOrder/ {print $2}')
+  if [[ -n $keep_data && -n $keep_part && $keep_part != "$esp_num" ]]; then
+    echo "Entrée « Windows Boot Manager » corrigée : partition EFI n°$esp_num (Windows avait écrit $keep_part)." >&2
+    tmp=$(mktemp)
+    printf '%s' "$keep_data" | python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))' >"$tmp"
+    efibootmgr -q -b "$keep" -B
+    efibootmgr -q --create --disk "/dev/$ESP_DISK" --part "$esp_num" --label "Windows Boot Manager" \
+      --loader '\EFI\Microsoft\Boot\bootmgfw.efi' --append-binary-args "$tmp"
+    rm -f "$tmp"
+    # la nouvelle entrée : sur la bonne partition ET avec les données (efibootmgr peut
+    # réutiliser le numéro qui vient d'être libéré)
+    new=$(efibootmgr -v | grep -F "Windows Boot Manager" | grep -i "HD($esp_num,GPT" |
+      grep -iE "bootmgfw\.efi\)?[0-9A-Fa-f]{16,}" | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p' | head -1)
+    [[ -n $new ]] || { warn "entrée Windows recréée introuvable"; return 1; }
+    # même place dans l'ordre de démarrage que l'entrée d'origine
+    order=$(sed -E "s/(^|,)$keep(,|$)/\1$new\2/" <<<"$order")
+    keep=$new
+  fi
+  # doublons sans données (dont ceux d'anciennes versions de linwin) : supprimés
+  for num in "${bare[@]}"; do
+    efibootmgr -q -b "$num" -B
+    order=$(sed -E "s/(^|,)$num(,|$)/\1\2/; s/,,/,/; s/^,|,$//g" <<<"$order")
+  done
+  efibootmgr -q --bootorder "$order" 2>/dev/null || true
+  echo "$keep"
+}
+
+# Linux a démarré alors que l'installation de Windows n'est pas finie (firmware qui
+# n'a pas suivi l'ordre de démarrage, choix de l'utilisateur…) : démarrage unique
+# vers Windows pour qu'il reprenne. Trois fois au plus, pour ne jamais boucler.
+resume_windows_setup() {
+  local state=$1 wbm tries=${RESUME_TRIES:-0}
+  if [[ -z $state ]]; then
+    echo "État de l'installation de Windows illisible : finalisation remise à plus tard."
+    return 0
+  fi
+  if ((tries >= 3)); then
+    warn "Windows n'a pas terminé son installation ($state) après 3 redémarrages : démarre-le depuis le menu de démarrage, puis lance « $(basename "$SELF") finish »"
+    return 0
+  fi
+  wbm=$(fix_windows_boot_entry) || true
+  [[ -n $wbm ]] || { warn "entrée « Windows Boot Manager » introuvable : démarre Windows à la main"; return 0; }
+  RESUME_TRIES=$((tries + 1))
+  save_state
+  echo "L'installation de Windows n'est pas terminée ($state) : redémarrage vers Windows pour la poursuivre (essai $RESUME_TRIES/3)."
+  efibootmgr -q --bootnext "$wbm"
+  if [[ $(init_kind) == systemd ]]; then
+    systemctl reboot --no-block
+  else
+    reboot
+  fi
+}
+
 # --- chargeurs de démarrage ---------------------------------------------------------
 
 # Le chargeur de Linux repasse en tête de l'ordre de démarrage UEFI : celui
 # enregistré par « prepare », sinon celui qui vient de démarrer Linux.
 linux_boot_first() {
-  local first=${LINUX_BOOT:-} order
-  [[ -n $first ]] && efibootmgr | grep -qi "^Boot$first" || first=$(boot_current)
+  local first order
+  # « finish » tourne sous Linux : l'entrée qui vient de le démarrer est la bonne.
+  # Celle notée par « prepare » peut être l'entrée générique du disque
+  # (\EFI\BOOT\BOOTX64.EFI), que l'installation de Windows peut réécrire.
+  first=$(boot_current)
+  if [[ -z $first ]] || efibootmgr | grep -i "^Boot$first" | grep -qi "Windows Boot Manager"; then
+    first=${LINUX_BOOT:-}
+  fi
   if [[ -z $first ]] || efibootmgr | grep -i "^Boot$first" | grep -qi "Windows Boot Manager"; then
     warn "entrée UEFI de Linux introuvable : vérifie l'ordre de démarrage dans le BIOS"
     return 0
@@ -1940,8 +2081,13 @@ menuentry 'Windows' --class windows --class os {
 GRUB
 EOF
     chmod 755 "$GRUB_SCRIPT"
-    # Ubuntu et Fedora masquent le menu quand un seul système est connu
-    if [[ -f /etc/default/grub ]]; then
+    # Ubuntu et Fedora masquent le menu quand un seul système est connu. Debian et
+    # Ubuntu lisent ensuite /etc/default/grub.d/*.cfg, qui peut remettre un délai
+    # nul (images cloud) : notre fichier y passe en dernier.
+    if [[ -d /etc/default/grub.d ]]; then
+      printf '%s\n' "# linwin : affiche le menu de GRUB pour choisir Windows (retiré par « linwin cancel »)" \
+        "GRUB_TIMEOUT_STYLE=menu" "GRUB_TIMEOUT=5" >/etc/default/grub.d/99-linwin.cfg
+    elif [[ -f /etc/default/grub ]]; then
       [[ -f $STATE_DIR/grub.default.bak ]] || cp /etc/default/grub "$STATE_DIR/grub.default.bak"
       sed -i -E 's/^GRUB_TIMEOUT_STYLE=.*hidden.*/GRUB_TIMEOUT_STYLE=menu/; s/^GRUB_TIMEOUT=["'\'']?0["'\'']?$/GRUB_TIMEOUT=5/' /etc/default/grub
     fi
@@ -1978,19 +2124,37 @@ loader_remove_windows() {
     fi
   fi
   if [[ -f $GRUB_SCRIPT ]]; then
-    rm -f "$GRUB_SCRIPT"
+    rm -f "$GRUB_SCRIPT" /etc/default/grub.d/99-linwin.cfg
     grub_regen || warn "configuration de GRUB non régénérée : lance update-grub"
   fi
 }
 
 cmd_finish() {
   as_root finish "$@"
-  local auto=0
-  [[ ${1:-} == --auto ]] && auto=1
+  local auto=0 force=0
+  while (($#)); do
+    case $1 in
+    --auto) auto=1; shift ;;
+    --force) force=1; shift ;;
+    *) die "option inconnue : $1" ;;
+    esac
+  done
   load_state
   if ! windows_installed; then
     ((auto)) && { echo "Windows n'est pas encore installé : rien à faire."; exit 0; }
     die "Windows n'est pas installé (partition n°$WIN_NUM non NTFS ou pas de « Windows Boot Manager »)"
+  fi
+  local setup_state
+  setup_state=$(windows_setup_state)
+  if [[ $setup_state != COMPLETE ]]; then
+    if ((auto)); then
+      resume_windows_setup "$setup_state"
+      exit 0
+    fi
+    if [[ -n $setup_state ]] && ((!force)); then
+      die "l'installation de Windows n'est pas terminée (état : $setup_state) : démarre Windows pour qu'elle se termine, puis relance « finish » (ou « finish --force »)"
+    fi
+    [[ -z $setup_state ]] && warn "état de l'installation de Windows illisible : finalisation quand même, à ta demande"
   fi
   find_esp || die "partition EFI introuvable (non montée ?)"
   local kind
@@ -2002,6 +2166,7 @@ cmd_finish() {
     STAGE_PARTUUID=$(blkid -s PARTUUID -o value "$dev" 2>/dev/null || true)
   fi
   remove_stage_entries
+  fix_windows_boot_entry >/dev/null || true
 
   phase 20 40 "Le chargeur de Linux redevient le premier choix au démarrage"
   linux_boot_first
@@ -2087,7 +2252,8 @@ cmd_drivers() {
   local mnt
   mnt=$(mktemp -d)
   # ntfs3 refuse un volume que Windows n'a pas fermé (hibernation, démarrage rapide)
-  if ! mount -t ntfs3 "$dev" "$mnt" 2>/dev/null && ! { command -v ntfs-3g >/dev/null && ntfs-3g "$dev" "$mnt" 2>/dev/null; }; then
+  ensure_ntfs
+  if ! mount_windows "$dev" "$mnt"; then
     rmdir "$mnt"
     die "impossible de monter $dev : Windows n'est pas complètement arrêté. Sous Windows, ouvre une invite de commandes administrateur, tape « powercfg /h off » puis redémarre vers Linux."
   fi
@@ -2139,7 +2305,7 @@ cmd_cancel() {
   local src=$STATE
   [[ -f $src ]] || src=$STATE.done
   [[ -f $src ]] || die "aucune installation à annuler ($STATE introuvable)"
-  MODE=shrink WIN_SETUP_ID= MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  MODE=shrink WIN_SETUP_ID= MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID= RESUME_TRIES=0
   # shellcheck disable=SC1090
   source "$src"
   local mode=$MODE s_disk=$DISK s_part=$PART_NUM msr=$MSR_NUM win=$WIN_NUM stg=$STAGE_NUM
@@ -2427,7 +2593,7 @@ Usage : $(basename "$SELF") [--progress] <commande> [options]
   boot                           démarre l'installeur au prochain redémarrage (root)
   drivers                        copie les pilotes réseau sur un Windows déjà installé, avec
                                  C:\\linwin\\installer-pilotes.cmd pour l'installer (root)
-  finish                         après l'installation : nettoyage + Windows dans le menu
+  finish  [--force]              après l'installation : nettoyage + Windows dans le menu
                                  du chargeur (GRUB, systemd-boot, Limine, rEFInd) (root)
                                  (automatique au démarrage de Linux en mode sans intervention)
   cancel  [--yes] [--key-stdin]  annule l'installation à n'importe quelle étape, même

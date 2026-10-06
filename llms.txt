@@ -14,6 +14,7 @@ Key facts:
   - Intel RST 20.2.6.1025 (iaStorVD, pinned SHA-256) for Intel VMD controllers 467F, A77F, 7D0B and AD0B.
   - Any other VMD controller and every PCI Wi-Fi or Ethernet card: Windows 10 x64 drivers from the Microsoft Update Catalog, SHA-1 verified and INF checked for the exact hardware ID.
 - Distributions: any common one. Missing tools (wimlib, cabextract, dosfstools, efibootmgr…) are installed with pacman, apt, dnf, zypper, xbps, apk or emerge.
+- Robustness (v1.1): finishes only when Windows reports IMAGE_STATE_COMPLETE and relaunches Windows setup if Linux boots too early; targets the Windows partition by its physical rank (Windows Setup numbering), not its GPT entry number; repairs the Windows UEFI boot entry when Windows writes a wrong EFI partition number. Tested end to end in an Ubuntu 24.04 VM (GRUB, ext4, free space).
 - Reversible: `linwin cancel` removes Windows, its boot entries and partitions at any step, and gives the space back to Linux.
 
 Install:

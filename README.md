@@ -1,4 +1,4 @@
-# linwin v1
+# linwin v1.1
 
 [![Licence GPL-3.0](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
 [![Version v1](https://img.shields.io/github/v/release/2Deathadder/linwin?label=version)](https://github.com/2Deathadder/linwin/releases/tag/v1)
@@ -344,6 +344,8 @@ Si linwin demande de redémarrer (code de sortie 3), redémarre puis relance
 | Windows absent du menu de démarrage | menu UEFI du PC (F8, F11, F12) ; avec GRUB : `sudo update-grub` (ou `grub-mkconfig -o …`) |
 | `impossible de monter … Windows n'est pas complètement arrêté` | sous Windows, en administrateur : `powercfg /h off`, puis redémarre vers Linux |
 | Pas de réseau sous Windows | `sudo linwin drivers` (§7) |
+| Linux a démarré au milieu de l'installation de Windows | rien à faire : linwin relance Windows pour qu'il termine. En manuel, `finish` refuse tant que Windows n'a pas fini (`finish --force` pour passer outre) |
+| Le menu GRUB reste caché | linwin ajoute `/etc/default/grub.d/99-linwin.cfg` (Debian, Ubuntu) ou modifie `/etc/default/grub` ; relance `sudo update-grub` si besoin |
 | L'interface demande libadwaita 1.5 | utilise la ligne de commande |
 
 Pour tout autre souci, le journal de l'interface (ou la sortie de la commande)
@@ -363,7 +365,15 @@ indique l'étape et la raison exacte. `linwin status` donne l'état complet en J
   installe les pilotes réseau, supprime `WINSETUP`, étend C:, efface les copies
   du fichier de réponses (le mot de passe y est encodé) et redémarre sous Linux.
 - **Finalisation** : un service (systemd ou OpenRC) lance `linwin finish --auto`
-  au démarrage de Linux tant que l'installation est en cours, puis se retire.
+  au démarrage de Linux tant que l'installation est en cours, puis se retire. Il ne
+  finalise que lorsque Windows a **réellement terminé** son installation (état lu
+  dans `Windows\Setup\State\State.ini`). Si Linux démarre avant (firmware qui n'a
+  pas suivi l'ordre de démarrage), il relance Windows pour qu'il termine, trois fois
+  au plus.
+- **Numérotation des partitions** : l'installeur Windows compte les partitions dans
+  leur ordre physique sur le disque, pas par numéro d'entrée GPT. linwin calcule ce
+  rang, et répare l'entrée UEFI de Windows si celui-ci y a écrit un mauvais numéro
+  de partition EFI (cas des tables qui ne sont pas dans l'ordre du disque).
 - **Prudence** : la table de partitions d'origine est sauvegardée dans
   `/var/lib/linwin/ptable-before.sfdisk` ; les signatures existantes ne sont
   jamais effacées lors des redimensionnements ; une seule opération à la fois
@@ -400,7 +410,8 @@ linwin [--progress] <commande> [options]
           [--vmd-driver DOSSIER] [--no-net-drivers]
           [--edition Home|Pro|Education --user NOM [--password-stdin]]
   boot                           démarre l'installeur au prochain redémarrage (root)
-  finish                         nettoyage + Windows dans le menu du chargeur (root)
+  finish  [--force]              nettoyage + Windows dans le menu du chargeur, une fois
+                                 l'installation de Windows terminée (root)
   drivers                        copie les pilotes réseau sur un Windows déjà installé (root)
   cancel  [--yes] [--key-stdin]  supprime Windows et rend l'espace (root)
   --version                      affiche la version
