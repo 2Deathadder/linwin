@@ -1,0 +1,42 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: linwin
+Upstream-Contact: 2Deathadder <thomwinner2007@gmail.com>
+Source: https://github.com/2Deathadder/linwin
+Disclaimer: linwin is free software (GPL-3+), but it is in contrib because it
+ downloads non-free software at the user's request to work: the Windows
+ installation image (chosen by the user), the Intel RST driver from Intel and
+ network drivers from the Microsoft Update Catalog.
+
+Files: *
+Copyright: 2026 2Deathadder
+License: GPL-3+
+
+Files: data/io.github._2Deathadder.linwin.metainfo.xml
+Copyright: 2026 2Deathadder
+License: CC0-1.0
+ To the extent possible under law, the author has waived all copyright and
+ related or neighboring rights to this metadata file.
+ .
+ On Debian systems, the complete text of the CC0 1.0 Universal license can be
+ found in "/usr/share/common-licenses/CC0-1.0".
+
+Files: debian/*
+Copyright: 2026 2Deathadder
+License: GPL-3+
+
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ .
+ On Debian systems, the complete text of the GNU General Public
+ License version 3 can be found in "/usr/share/common-licenses/GPL-3".

@@ -1,0 +1,44 @@
+Source: linwin
+Section: contrib/admin
+Maintainer: 2Deathadder <thomwinner2007@gmail.com>
+Build-Depends: debhelper-compat (= 14)
+Standards-Version: 4.7.2
+Homepage: https://2deathadder.github.io/linwin/
+Vcs-Browser: https://github.com/2Deathadder/linwin/tree/debian/latest
+Vcs-Git: https://github.com/2Deathadder/linwin.git -b debian/latest
+
+Package: linwin
+Architecture: all
+Depends: cabextract,
+         curl,
+         dosfstools,
+         efibootmgr,
+         fdisk,
+         python3,
+         udev,
+         wimtools,
+         ${misc:Depends}
+Recommends: btrfs-progs,
+            cryptsetup-bin,
+            gir1.2-adw-1,
+            gir1.2-gtk-4.0,
+            ntfs-3g,
+            pciutils,
+            pkexec,
+            python3-gi
+Description: install Windows 10 as a dual-boot from Linux without a USB drive
+ linwin installs Windows 10 next to an existing Linux system without a USB
+ stick or DVD. It creates the partitions in unallocated disk space (or shrinks
+ a Btrfs root filesystem online, LUKS included), copies the Windows installer
+ to a temporary partition that replaces the USB drive, boots it once through a
+ one-time UEFI entry and installs Windows unattended. Linux then becomes the
+ default again and Windows is added to the GRUB, systemd-boot, Limine or
+ rEFInd menu. Everything can be undone with one command.
+ .
+ The Intel RST/VMD storage driver and Wi-Fi/Ethernet drivers are added to the
+ installer automatically. A GTK 4 interface (linwin-gui) is included; messages
+ are in French.
+ .
+ This package is in contrib because it downloads non-free software at the
+ user's request: the Windows installation image, the Intel RST driver from
+ Intel and network drivers from the Microsoft Update Catalog.
