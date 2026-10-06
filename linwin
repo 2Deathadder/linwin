@@ -1299,6 +1299,9 @@ write_unattend() {
       $intl
     </component>
     <component name="Microsoft-Windows-Setup" $arch>
+      <!-- Pas de <Letter> : dans WinPE la partition vierge reçoit souvent déjà C:, et
+           Setup refuse alors de la lui réattribuer (CanAssignLetter, 0x80300024).
+           Le Windows installé se voit de toute façon en C:. -->
       <DiskConfiguration>
         <WillShowUI>OnError</WillShowUI>
         <Disk wcm:action="modify">
@@ -1310,7 +1313,6 @@ write_unattend() {
               <PartitionID>$WIN_NUM</PartitionID>
               <Format>NTFS</Format>
               <Label>Windows</Label>
-              <Letter>C</Letter>
             </ModifyPartition>
           </ModifyPartitions>
         </Disk>
