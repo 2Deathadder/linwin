@@ -397,5 +397,14 @@ confirmation `OUI`.
 
 ---
 
+## Licence
+
+linwin est un logiciel libre distribué sous licence
+[GNU GPL version 3 ou ultérieure](LICENSE) : tu peux l'utiliser, l'étudier, le
+modifier et le redistribuer, à condition que les versions modifiées restent sous
+la même licence. Il est fourni **sans aucune garantie**.
+
+---
+
 *linwin n'est affilié ni à Microsoft ni à Intel. Windows est une marque de
 Microsoft Corporation. Utilisation à tes propres risques : sauvegarde d'abord.*

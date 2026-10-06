@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 2Deathadder — https://github.com/2Deathadder/linwin
 """linwin-gui — interface graphique de linwin v1.
 
 L'interface ne fait rien elle-même : elle lit l'état avec « linwin status »

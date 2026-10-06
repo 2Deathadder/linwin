@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 2Deathadder — https://github.com/2Deathadder/linwin
 # linwin v1 — installe Windows 10 en dual-boot natif depuis Linux, sans clé USB.
 #
 # Principe : on trouve de la place sur le disque de la partition EFI — de l'espace
