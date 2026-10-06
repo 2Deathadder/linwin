@@ -646,7 +646,7 @@ save_state() {
   mkdir -p "$STATE_DIR"
   local k
   : >"$STATE.tmp"
-  for k in MODE DISK PART_NUM MSR_NUM WIN_NUM STAGE_NUM MSR_START WIN_START STAGE_START STAGED UNATTENDED VMD_DRIVER NET_DRIVERS STAGE_PARTUUID LINUX_BOOT; do
+  for k in MODE DISK PART_NUM MSR_NUM WIN_NUM WIN_SETUP_ID STAGE_NUM MSR_START WIN_START STAGE_START STAGED UNATTENDED VMD_DRIVER NET_DRIVERS STAGE_PARTUUID LINUX_BOOT; do
     # vide reste vide (STAGE_PARTUUID, LINUX_BOOT) : load_state pose les défauts
     printf '%s=%q\n' "$k" "${!k-}" >>"$STATE.tmp"
   done
@@ -655,7 +655,7 @@ save_state() {
 
 load_state() {
   [[ -f $STATE ]] || die "aucun état trouvé ($STATE) : lance d'abord « prepare »"
-  MODE=shrink MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  MODE=shrink WIN_SETUP_ID= MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
   # shellcheck disable=SC1090
   source "$STATE"
 }
@@ -1288,7 +1288,8 @@ write_unattend() {
       <UserLocale>$U_LOCALE</UserLocale>"
   sed 's/$/\r/' >"$file" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Généré par linwin : installation sans intervention sur la partition $WIN_NUM du disque $disk_id. -->
+<!-- Généré par linwin : installation sans intervention sur la partition $WIN_SETUP_ID (rang sur le disque ;
+     entrée GPT n°$WIN_NUM) du disque $disk_id. -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">$(((U_DRIVERS)) && echo "
     <component name=\"Microsoft-Windows-PnpCustomizationsWinPE\" $arch>
@@ -1310,7 +1311,7 @@ write_unattend() {
           <ModifyPartitions>
             <ModifyPartition wcm:action="add">
               <Order>1</Order>
-              <PartitionID>$WIN_NUM</PartitionID>
+              <PartitionID>$WIN_SETUP_ID</PartitionID>
               <Format>NTFS</Format>
               <Label>Windows</Label>
             </ModifyPartition>
@@ -1322,7 +1323,7 @@ write_unattend() {
           <InstallFrom>
             <MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData>
           </InstallFrom>
-          <InstallTo><DiskID>$disk_id</DiskID><PartitionID>$WIN_NUM</PartitionID></InstallTo>
+          <InstallTo><DiskID>$disk_id</DiskID><PartitionID>$WIN_SETUP_ID</PartitionID></InstallTo>
           <WillShowUI>OnError</WillShowUI>
         </OSImage>
       </ImageInstall>
@@ -1506,6 +1507,10 @@ cmd_stage() {
   fi
   load_state
   for t in python3 curl cabextract efibootmgr; do ensure_tool "$t"; done
+  WIN_SETUP_ID=$(setup_part_id)
+  [[ $WIN_SETUP_ID =~ ^[0-9]+$ ]] || die "partition Windows n°$WIN_NUM absente de la table de /dev/$DISK"
+  [[ $WIN_SETUP_ID == "$WIN_NUM" ]] ||
+    echo "Note : l'installeur Windows numérote cette partition $WIN_SETUP_ID (rang sur le disque), Linux $WIN_NUM."
   if [[ -n $driver ]]; then
     [[ -n $(find "$driver" -iname '*.inf' -print -quit) ]] || die "aucun .inf dans $driver"
     vmd_active && ! driver_supports "$driver" &&
@@ -1707,7 +1712,7 @@ cmd_boot() {
     install_auto_finish
     cat <<EOF
 Prêt. Au prochain redémarrage, Windows s'installe tout seul (20 à 40 minutes, plusieurs redémarrages) :
-  installeur → partition n°$WIN_NUM uniquement → compte local → première session automatique
+  installeur → partition n°${WIN_SETUP_ID:-$WIN_NUM} uniquement → compte local → première session automatique
   → retour automatique sous Linux, qui finalise au démarrage (Windows ajouté au menu de $(loader_label "$(boot_loader_kind)")).
 Ne touche à rien pendant ce temps. Laisse le chargeur branché.
 EOF
@@ -1723,7 +1728,7 @@ Linux reste le choix par défaut ensuite.
 Dans l'installeur :
   1. « Je n'ai pas de clé de produit » si tu n'en as pas, puis choisis l'édition.
   2. Type d'installation : « Personnalisée ».
-  3. Sélectionne UNIQUEMENT « Lecteur 0 Partition $WIN_NUM » (~$size_gb Go, « Espace non alloué » ou non formatée),
+  3. Sélectionne UNIQUEMENT « Lecteur 0 Partition ${WIN_SETUP_ID:-$WIN_NUM} » (~$size_gb Go, « Espace non alloué » ou non formatée),
      clique « Formater » si demandé, puis « Suivant ».
      Ne supprime ni ne formate AUCUNE autre partition$( ((PART_NUM)) && echo " : la n°$PART_NUM est Linux").
 $( ((VMD_DRIVER)) && echo "     Si aucun disque n'apparaît : « Charger un pilote » → Parcourir → $STAGE_LABEL\\\$WinPEDriver\$\\vmd.")
@@ -2048,6 +2053,15 @@ for p in json.load(sys.stdin)["partitiontable"].get("partitions", []):
     print(re.search(r"(\d+)$", p["node"]).group(1), p["start"], p["size"], p["type"].upper(), p.get("name", "").replace(" ", "_") or "-")'
 }
 
+# Numéro de la partition Windows tel que le compte l'installeur Windows (PartitionID du
+# fichier de réponses, « Partition N » à l'écran) : son RANG par position sur le disque,
+# et non son numéro d'entrée GPT (celui de Linux et de diskpart). Les deux diffèrent
+# quand la table n'est pas dans l'ordre du disque (images cloud, disques réorganisés) :
+# avec le numéro GPT, l'installeur viserait une AUTRE partition.
+setup_part_id() {
+  part_table "$DISK" | sort -k2,2n | awk -v n="$WIN_NUM" '{ i++ } $1 == n { print i; exit }'
+}
+
 # Copie les pilotes réseau sur la partition d'un Windows déjà installé (par
 # exemple installé sans eux) : C:\linwin\installer-pilotes.cmd les installe.
 cmd_drivers() {
@@ -2125,7 +2139,7 @@ cmd_cancel() {
   local src=$STATE
   [[ -f $src ]] || src=$STATE.done
   [[ -f $src ]] || die "aucune installation à annuler ($STATE introuvable)"
-  MODE=shrink MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  MODE=shrink WIN_SETUP_ID= MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
   # shellcheck disable=SC1090
   source "$src"
   local mode=$MODE s_disk=$DISK s_part=$PART_NUM msr=$MSR_NUM win=$WIN_NUM stg=$STAGE_NUM
@@ -2369,6 +2383,7 @@ cmd_status() {
   "needs_reboot": $(json_bool $needs_reboot),
   "part_num": $part_num,
   "win_num": $win_num,
+  "win_setup_id": ${WIN_SETUP_ID:-0},
   "staged": $(json_bool "$staged"),
   "unattended": $(json_bool "${UNATTENDED:-0}"),
   "auto_finish": $(auto_finish_installed && echo true || echo false),

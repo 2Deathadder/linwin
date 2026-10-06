@@ -687,7 +687,7 @@ class Window(Adw.ApplicationWindow):
         elif auto:
             self.s_install.set("wait", "Automatique : rien à faire, compter 20 à 40 minutes", True)
         elif bootnext or staged:
-            self.s_install.set("wait", f"Dans l'installeur : partition n°{st.get('win_num', '?')} uniquement", True)
+            self.s_install.set("wait", f"Dans l'installeur : partition n°{st.get('win_setup_id') or st.get('win_num') or '?'} uniquement", True)
         else:
             self.s_install.set("wait", "Se fait dans l'installeur Windows", True)
 
@@ -959,12 +959,12 @@ class Window(Adw.ApplicationWindow):
                     "2. Windows crée ton compte local et ouvre une première session tout seul.\n"
                     f"3. Il redémarre sous Linux, qui finalise au démarrage : Windows apparaît ensuite dans le menu de {st.get('loader_label', '?')}.\n\n"
                     "Si la partition n'est pas reconnue, l'installeur passe en mode manuel par sécurité : "
-                    f"choisis alors uniquement la partition n°{st.get('win_num') or '?'}.\n"
+                    f"choisis alors uniquement la partition n°{st.get('win_setup_id') or st.get('win_num') or '?'}.\n"
                     "Laisse le chargeur branché.")
         return ("Dans l'installeur Windows :\n"
                 "1. « Je n'ai pas de clé de produit » si tu n'en as pas, puis choisis l'édition.\n"
                 "2. Type d'installation : « Personnalisée ».\n"
-                f"3. Sélectionne UNIQUEMENT « Lecteur 0 Partition {st.get('win_num') or '?'} » "
+                f"3. Sélectionne UNIQUEMENT « Lecteur 0 Partition {st.get('win_setup_id') or st.get('win_num') or '?'} » "
                 f"({self.cfg.get('size', 100)} Go), clique « Formater » si demandé, puis « Suivant ».\n"
                 "Ne touche à AUCUNE autre partition : elles appartiennent à Linux ou au système.\n"
                 + ("Si aucun disque n'apparaît (Intel VMD) : « Charger un pilote » → Parcourir → "
