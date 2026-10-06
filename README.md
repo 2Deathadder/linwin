@@ -1,4 +1,4 @@
-# linwin v1.1
+# linwin v1.2
 
 [![Licence GPL-3.0](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
 [![Version v1](https://img.shields.io/github/v/release/2Deathadder/linwin?label=version)](https://github.com/2Deathadder/linwin/releases/latest)
@@ -105,10 +105,19 @@ commande : elle fait exactement la même chose.
 
 ## 2. Installation de linwin
 
+**Debian, Ubuntu et dérivées** : télécharge le paquet `.deb` de la
+[dernière version](https://github.com/2Deathadder/linwin/releases/latest), puis :
+
+```bash
+sudo apt install ./linwin_*_all.deb
+```
+
+**Toutes distributions** :
+
 ```bash
 git clone https://github.com/2Deathadder/linwin.git
 cd linwin
-sudo ./linwin install
+sudo ./linwin install        # ou : sudo make install
 ```
 
 `install` copie linwin dans `/usr/local/lib/linwin` (propriété de root, non

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=linwin
+GenericName=Windows dual-boot installer
+GenericName[fr]=Installeur de Windows en dual-boot
+Comment=Install Windows 10 alongside Linux without a USB drive
+Comment[fr]=Installer Windows 10 à côté de Linux, sans clé USB
+Exec=linwin-gui
+Icon=io.github._2Deathadder.linwin
+Terminal=false
+Categories=System;
+Keywords=windows;dual-boot;dualboot;installer;usb;grub;
+StartupWMClass=io.github._2Deathadder.linwin

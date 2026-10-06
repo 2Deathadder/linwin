@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 2Deathadder — https://github.com/2Deathadder/linwin
-"""linwin-gui — interface graphique de linwin v1.1.
+"""linwin-gui — interface graphique de linwin v1.2.
 
 L'interface ne fait rien elle-même : elle lit l'état avec « linwin status »
 et lance les étapes de la CLI (via pkexec pour celles qui exigent root). La CLI
@@ -29,10 +29,12 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 # libadwaita 1.5 au minimum (AlertDialog) : Ubuntu 24.04, Fedora 40, Debian 13…
 ADW_OK = (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 5)
 
-VERSION = "1.1"
+VERSION = "1.2"
 APP_ID = "io.github._2Deathadder.linwin"
 HERE = os.path.dirname(os.path.realpath(__file__))
 LOCAL_CLI = os.path.join(HERE, "linwin")
+# copie de confiance : celle d'un paquet (/usr/lib), sinon celle de « linwin install »
+PACKAGED_CLI = "/usr/lib/linwin/linwin"
 INSTALLED_CLI = "/usr/local/lib/linwin/linwin"
 LOCK = "/run/linwin.lock"
 RUN_LOG = "/run/linwin.log"
@@ -65,6 +67,10 @@ def trusted(path):
         return False
 
 
+if trusted(PACKAGED_CLI):
+    INSTALLED_CLI = PACKAGED_CLI
+
+
 def cli():
     """La CLI à lancer en root : la copie de confiance si elle existe."""
     return INSTALLED_CLI if trusted(INSTALLED_CLI) else LOCAL_CLI
@@ -72,6 +78,8 @@ def cli():
 
 def outdated():
     """Vrai si la copie installée diffère des fichiers de ce dossier (mise à jour à installer)."""
+    if INSTALLED_CLI == PACKAGED_CLI:
+        return False  # mise à jour par le gestionnaire de paquets
     installed_dir = os.path.dirname(INSTALLED_CLI)
     for name in ("linwin", "linwin-gui"):
         try:

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 2Deathadder — https://github.com/2Deathadder/linwin
-# linwin v1.1 — installe Windows 10 en dual-boot natif depuis Linux, sans clé USB.
+# linwin v1.2 — installe Windows 10 en dual-boot natif depuis Linux, sans clé USB.
 #
 # Principe : on trouve de la place sur le disque de la partition EFI — de l'espace
 # non alloué (n'importe quelle distribution, n'importe quel système de fichiers),
@@ -18,7 +18,7 @@
 # Étapes :  check → plan → iso → prepare → stage → boot → (installer Windows) → finish
 set -euo pipefail
 
-VERSION=1.1
+VERSION=1.2
 STATE_DIR=/var/lib/linwin
 STATE=$STATE_DIR/state
 MIB=2048                 # secteurs de 512 octets par Mio
@@ -50,6 +50,13 @@ LEGACY=win-dualboot          # ancien nom du projet (avant la v1) : repris par �
 LEGACY_EFI_LABEL="Windows 10 Setup ($LEGACY)"
 
 SELF=$(readlink -f "$0")
+
+# Installé par un paquet (Debian…) ou par « make install PREFIX=/usr » : ce fichier
+# est lui-même la copie de confiance, il n'y a rien à copier.
+PACKAGED=0
+if [[ $SELF == /usr/lib/linwin/linwin ]]; then
+  PACKAGED=1 INSTALL_DIR=/usr/lib/linwin INSTALLED_BIN=$SELF
+fi
 
 # --- utilitaires ---------------------------------------------------------------
 
@@ -1788,6 +1795,12 @@ EOF
 
 cmd_install() {
   as_root install "$@"
+  if ((PACKAGED)); then
+    migrate_legacy
+    installed_trusted || die "la copie du paquet n'est pas sûre ($SELF) : réinstalle le paquet"
+    echo "linwin est installé par le paquet ($SELF) : rien à faire."
+    return 0
+  fi
   install_files
   installed_trusted || die "la copie installée n'est pas sûre (droits de $INSTALL_DIR ?)"
   if ((${MIGRATE_UNIT:-0})); then

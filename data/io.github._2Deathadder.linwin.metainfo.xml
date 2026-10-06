@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 2Deathadder -->
+<component type="desktop-application">
+  <id>io.github._2Deathadder.linwin</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>linwin</name>
+  <summary>Install Windows 10 as a dual-boot from Linux without a USB drive</summary>
+  <summary xml:lang="fr">Installer Windows 10 en dual-boot depuis Linux, sans clé USB</summary>
+  <developer id="io.github._2deathadder">
+    <name>2Deathadder</name>
+  </developer>
+  <description>
+    <p>
+      linwin installs Windows 10 next to an existing Linux system without a USB stick or DVD.
+      It creates the partitions in unallocated disk space (or shrinks a Btrfs root online),
+      copies the Windows installer to a temporary partition that replaces the USB drive,
+      boots it once and installs Windows unattended.
+    </p>
+    <p xml:lang="fr">
+      linwin installe Windows 10 à côté d'un Linux existant, sans clé USB ni DVD. Il crée les
+      partitions dans l'espace non alloué du disque (ou réduit à chaud une racine Btrfs), copie
+      l'installeur Windows sur une partition temporaire qui remplace la clé USB, démarre dessus
+      une fois et installe Windows sans intervention.
+    </p>
+    <ul>
+      <li>Unattended installation, with automatic return to Linux</li>
+      <li>Intel RST/VMD storage driver and Wi-Fi/Ethernet drivers added automatically</li>
+      <li>Windows added to the GRUB, systemd-boot, Limine or rEFInd menu</li>
+      <li>Can be undone at any step</li>
+    </ul>
+    <p>
+      linwin downloads non-free software at the user's request: the Windows installation image
+      is chosen by the user, and drivers come from Intel and the Microsoft Update Catalog.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github._2Deathadder.linwin.desktop</launchable>
+  <url type="homepage">https://2deathadder.github.io/linwin/</url>
+  <url type="bugtracker">https://github.com/2Deathadder/linwin/issues</url>
+  <url type="vcs-browser">https://github.com/2Deathadder/linwin</url>
+  <categories>
+    <category>System</category>
+  </categories>
+  <keywords>
+    <keyword>dual-boot</keyword>
+    <keyword>windows</keyword>
+    <keyword>installer</keyword>
+    <keyword>usb</keyword>
+  </keywords>
+  <provides>
+    <binary>linwin</binary>
+    <binary>linwin-gui</binary>
+  </provides>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.2" date="2026-10-06">
+      <description><p>Packaging support: make install, manual pages, AppStream metadata.</p></description>
+    </release>
+    <release version="1.1" date="2026-10-06">
+      <description><p>Reliability fixes found by an end-to-end test in an Ubuntu 24.04 virtual machine.</p></description>
+    </release>
+    <release version="1" date="2026-10-06"/>
+  </releases>
+</component>

@@ -1,0 +1,107 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.TH LINWIN 1 "2026-10-06" "linwin 1.2" "Commandes utilisateur"
+.SH NOM
+linwin \- installer Windows 10 en dual-boot depuis Linux, sans clé USB
+.SH SYNOPSIS
+.B linwin
+.RB [ \-\-progress ]
+.I commande
+.RI [ options ]
+.br
+.B linwin-gui
+.SH DESCRIPTION
+.B linwin
+installe Windows 10 à côté d'un Linux existant, sans clé USB ni DVD. Il crée trois
+partitions sur le disque de la partition EFI (MSR, Windows et une partition FAT32
+temporaire nommée WINSETUP qui remplace la clé USB), y copie l'installeur Windows, démarre
+dessus une seule fois grâce à une entrée UEFI à usage unique (BootNext), installe Windows
+(sans intervention si demandé), puis remet Linux par défaut et ajoute Windows au menu du
+chargeur de démarrage.
+.PP
+La place est prise dans l'espace non alloué du disque (tout système de fichiers, aucune
+partition existante n'est modifiée), sinon en réduisant à chaud une racine Btrfs,
+éventuellement dans LUKS.
+.PP
+.B linwin-gui
+est une interface GTK 4 qui lance les mêmes commandes.
+.SH COMMANDES
+.TP
+.B check
+Compatibilité du PC, place disponible, chargeur de démarrage et pilotes.
+.TP
+.B status
+État complet en JSON (utilisé par l'interface).
+.TP
+.BI "plan \-\-size " TAILLE
+Partitionnement prévu, sans rien modifier (par exemple \fB100G\fR).
+.TP
+.BR iso " [" \-\-lang
+.IR LANGUE ]
+Télécharge l'ISO de Windows 10 22H2 chez Microsoft dans ~/Downloads.
+.TP
+.BI "prepare \-\-size " TAILLE
+Crée les partitions MSR, Windows et WINSETUP (root). Options :
+.B \-\-stage\-size
+.IR TAILLE ,
+.B \-\-mode
+.BR free | shrink ,
+.BR \-\-yes ,
+.B \-\-key\-stdin
+(passphrase LUKS sur l'entrée standard).
+.TP
+.BI "stage \-\-iso " FICHIER
+Copie l'installeur sur WINSETUP et ajoute les pilotes (root). Options :
+.B \-\-vmd\-driver
+.IR DOSSIER ,
+.BR \-\-no\-net\-drivers ,
+et pour une installation sans intervention
+.B \-\-edition
+.BR Home | Pro | Education
+.B \-\-user
+.I NOM
+.RB [ \-\-password\-stdin ].
+.TP
+.B boot
+Démarre l'installeur Windows au prochain redémarrage, une seule fois (root).
+.TP
+.BR finish " [" \-\-force ]
+Une fois Windows installé : supprime WINSETUP et les entrées de l'installeur, remet Linux
+par défaut et ajoute Windows au menu du chargeur (root). Automatique au démarrage en mode
+sans intervention.
+.TP
+.B drivers
+Copie les pilotes réseau sur un Windows déjà installé (root).
+.TP
+.BR cancel " [" \-\-yes "] [" \-\-key\-stdin ]
+Retire Windows à n'importe quelle étape, même après l'installation, et rend la place (root).
+.TP
+.B install
+Installe une copie appartenant à root dans /usr/local/lib/linwin (inutile avec un paquet).
+.SH EXIGENCES
+Un PC x86-64 démarré en UEFI 64 bits, un disque GPT à secteurs de 512 octets et une
+partition EFI montée.
+.SH FICHIERS
+.TP
+.I /var/lib/linwin/state
+État de l'installation en cours
+.RI ( state.done
+une fois terminée).
+.TP
+.I /var/lib/linwin/ptable-before.sfdisk
+Sauvegarde de la table de partitions faite par
+.BR prepare .
+.TP
+.I /run/linwin.log
+Sortie de l'opération en cours.
+.SH NOTES
+linwin télécharge des logiciels non libres à la demande de l'utilisateur : l'image
+d'installation de Windows, le pilote Intel RST chez Intel et les pilotes réseau du catalogue
+Microsoft Update. Sauvegarde tes données avant de modifier la table de partitions.
+.SH VOIR AUSSI
+.BR efibootmgr (8),
+.BR sfdisk (8),
+.BR wimlib\-imagex (1)
+.PP
+https://2deathadder.github.io/linwin/
+.SH AUTEUR
+2Deathadder
