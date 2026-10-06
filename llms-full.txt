@@ -38,7 +38,7 @@ Typical CLI flow: `linwin plan --size 100G` → `sudo linwin prepare --size 100G
 
 ## Download
 
-- [Release v1](https://github.com/2Deathadder/linwin/releases/tag/v1)
+- [Latest release](https://github.com/2Deathadder/linwin/releases/latest)
 - [Source code](https://github.com/2Deathadder/linwin)
 
 ## Optional
@@ -53,7 +53,7 @@ Typical CLI flow: `linwin plan --size 100G` → `sudo linwin prepare --size 100G
 # linwin v1.1
 
 [![Licence GPL-3.0](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
-[![Version v1](https://img.shields.io/github/v/release/2Deathadder/linwin?label=version)](https://github.com/2Deathadder/linwin/releases/tag/v1)
+[![Version v1](https://img.shields.io/github/v/release/2Deathadder/linwin?label=version)](https://github.com/2Deathadder/linwin/releases/latest)
 [![Site](https://img.shields.io/badge/site-2deathadder.github.io%2Flinwin-informational)](https://2deathadder.github.io/linwin/)
 
 **Installer Windows 10 à côté de Linux, en dual-boot natif, sans clé USB.**

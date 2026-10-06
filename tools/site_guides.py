@@ -13,7 +13,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs")
 BASE = "https://2deathadder.github.io/linwin/"
 DATE = "2026-10-06"
 REPO = "https://github.com/2Deathadder/linwin"
-RELEASE = REPO + "/releases/tag/v1"
+RELEASE = REPO + "/releases/latest"
 VERIF = '<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />'
 
 INSTALL = """<pre><code>git clone https://github.com/2Deathadder/linwin.git
@@ -405,12 +405,12 @@ entry.</p>
 ]
 
 UI = {
-    "fr": {"home": "Accueil", "guides": "Guides", "manual": "Manuel", "other": "English", "dl": "Télécharger linwin v1",
+    "fr": {"home": "Accueil", "guides": "Guides", "manual": "Manuel", "other": "English", "dl": "Télécharger linwin",
            "cta": "linwin est libre (GPL-3.0) et fonctionne sur toutes les distributions courantes.",
            "list_title": "Guides : dual-boot Windows et Linux sans clé USB",
            "list_desc": "Guides pratiques pour installer Windows 10 à côté de Linux sans clé USB : Ubuntu, GRUB, systemd-boot, Intel VMD/RST.",
            "footer": "linwin v1 — logiciel libre sous licence GPL-3.0, par 2Deathadder. linwin n'est affilié ni à Microsoft ni à Intel."},
-    "en": {"home": "Home", "guides": "Guides", "manual": "Manual (French)", "other": "Français", "dl": "Download linwin v1",
+    "en": {"home": "Home", "guides": "Guides", "manual": "Manual (French)", "other": "Français", "dl": "Download linwin",
            "cta": "linwin is free software (GPL-3.0) and works on all common distributions.",
            "list_title": "Guides: Windows and Linux dual-boot without a USB drive",
            "list_desc": "Practical guides to install Windows 10 alongside Linux without a USB drive: Ubuntu, GRUB, systemd-boot, Intel VMD/RST.",
