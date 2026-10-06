@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dual-boot Windows 10 et Linux sans clé USB : le guide complet | linwin</title>
+<meta name="description" content="Comment installer Windows 10 en dual-boot depuis un Linux déjà installé, sans clé USB ni DVD : principe, prérequis, étapes et retour arrière avec linwin.">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/guides/dual-boot-sans-cle-usb/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/guides/dual-boot-sans-cle-usb/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/guides/dual-boot-sans-cle-usb/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/guides/dual-boot-sans-cle-usb/">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:title" content="Dual-boot Windows 10 et Linux sans clé USB : le guide complet | linwin">
+<meta property="og:description" content="Comment installer Windows 10 en dual-boot depuis un Linux déjà installé, sans clé USB ni DVD : principe, prérequis, étapes et retour arrière avec linwin.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/guides/dual-boot-sans-cle-usb/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Accueil",
+          "item": "https://2deathadder.github.io/linwin/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Guides",
+          "item": "https://2deathadder.github.io/linwin/guides/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "Installer Windows 10 à côté de Linux sans clé USB",
+          "item": "https://2deathadder.github.io/linwin/guides/dual-boot-sans-cle-usb/"
+        }
+      ]
+    },
+    {
+      "@type": "TechArticle",
+      "headline": "Installer Windows 10 à côté de Linux sans clé USB",
+      "description": "Comment installer Windows 10 en dual-boot depuis un Linux déjà installé, sans clé USB ni DVD : principe, prérequis, étapes et retour arrière avec linwin.",
+      "inLanguage": "fr",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "author": {
+        "@type": "Person",
+        "name": "2Deathadder",
+        "url": "https://github.com/2Deathadder"
+      },
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "mainEntityOfPage": "https://2deathadder.github.io/linwin/guides/dual-boot-sans-cle-usb/",
+      "about": {
+        "@id": "https://2deathadder.github.io/linwin/#app"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="../../">linwin</a>
+    <nav>
+      <a href="../../">Accueil</a>
+      <a href="../../guides/">Guides</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      <a href="https://2deathadder.github.io/linwin/en/guides/dual-boot-sans-cle-usb/" hreflang="en" lang="en">English</a>
+    </nav>
+  </header>
+  <main class="article">
+    <h1>Installer Windows 10 à côté de Linux sans clé USB</h1>
+
+<p>La méthode classique pour ajouter Windows à côté de Linux demande une clé USB d'au moins 8 Go, un outil pour la
+préparer (Rufus, Ventoy, WoeUSB…), un passage dans le BIOS et un partitionnement à la main. <strong>linwin</strong>
+fait tout cela depuis Linux, sans clé USB.</p>
+
+<h2>Le principe : une partition remplace la clé USB</h2>
+<ol>
+<li><strong>Faire de la place</strong> : linwin crée trois partitions dans l'espace non alloué du disque (ou en
+réduisant à chaud une racine Btrfs) : MSR, Windows et une partition FAT32 de 8 Go nommée <code>WINSETUP</code>.</li>
+<li><strong>Copier l'installeur</strong> : l'ISO de Windows 10 est copiée sur <code>WINSETUP</code>, qui joue le rôle de
+la clé USB. Les pilotes nécessaires (Intel RST/VMD, Wi-Fi, Ethernet) et les réponses automatiques y sont ajoutés.</li>
+<li><strong>Démarrer une seule fois dessus</strong> : une entrée UEFI à usage unique (<code>BootNext</code>) lance
+l'installeur au prochain redémarrage ; ensuite, le PC reprend son ordre normal.</li>
+<li><strong>Installer sans intervention</strong> : l'installeur repère la partition Windows à l'octet près et
+n'écrit que là, crée ton compte, puis redémarre sous Linux.</li>
+<li><strong>Finaliser</strong> : Linux redevient le choix par défaut, <code>WINSETUP</code> est supprimée et Windows
+est ajouté au menu de GRUB, systemd-boot, Limine ou rEFInd.</li>
+</ol>
+
+<h2>Prérequis</h2>
+<ul>
+<li>PC x86-64 démarré en <strong>UEFI</strong> (pas en mode Legacy/CSM), disque en <strong>GPT</strong> ;</li>
+<li>l'ISO de Windows 10 (64 bits), téléchargeable chez Microsoft depuis Linux ;</li>
+<li>de la place : taille de Windows (32 Go minimum, 64 Go conseillés) + 8 Go pour l'installeur ;</li>
+<li>une sauvegarde de tes données, et le chargeur branché.</li>
+</ul>
+
+<h2>Les étapes</h2>
+<pre><code>git clone https://github.com/2Deathadder/linwin.git
+cd linwin
+sudo ./linwin install
+linwin check</code></pre>
+<p>Puis, dans l'application <strong>linwin</strong> ou en ligne de commande :</p>
+<pre><code>linwin plan --size 100G
+sudo linwin prepare --size 100G
+sudo linwin stage --iso ~/Downloads/Win10_22H2_French_x64v1.iso --edition Home --user moi
+sudo linwin boot
+sudo reboot</code></pre>
+<p>Windows s'installe seul (20 à 40 minutes), puis le PC revient sous Linux qui termine la configuration.</p>
+
+<h2>Et si je change d'avis ?</h2>
+<p><code>sudo linwin cancel</code> retire Windows à n'importe quelle étape, même une fois installé : entrées de
+démarrage, partitions, puis l'espace est rendu (à Linux en cas de réduction, en espace libre sinon).</p>
+
+<h2>Comparaison avec les méthodes classiques</h2>
+<div class="table-scroll"><table>
+<tr><th></th><th>Clé USB (Rufus, Ventoy…)</th><th>linwin</th></tr>
+<tr><th>Clé USB</th><td>obligatoire</td><td>aucune</td></tr>
+<tr><th>Partitionnement</th><td>à la main</td><td>automatique et vérifié</td></tr>
+<tr><th>Pilotes SSD (VMD) et Wi-Fi</th><td>à trouver soi-même</td><td>ajoutés automatiquement</td></tr>
+<tr><th>Menu de démarrage Linux</th><td>souvent à réparer</td><td>Linux reste par défaut, Windows ajouté</td></tr>
+<tr><th>Retour arrière</th><td>manuel</td><td><code>linwin cancel</code></td></tr>
+</table></div>
+
+    <section>
+      <p>linwin est libre (GPL-3.0) et fonctionne sur toutes les distributions courantes.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Télécharger linwin v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      </div>
+    </section>
+  </main>
+  <footer>linwin v1 — logiciel libre sous licence GPL-3.0, par 2Deathadder. linwin n'est affilié ni à Microsoft ni à Intel. <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a></footer>
+</div>
+</body>
+</html>

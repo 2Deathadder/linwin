@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Installer Windows 10 à côté d&#x27;Ubuntu, Linux Mint ou Debian sans clé USB | linwin</title>
+<meta name="description" content="Ajouter Windows 10 en dual-boot à un Ubuntu, Linux Mint ou Debian existant, sans clé USB : place disponible (ext4), GRUB, pilotes, étapes avec linwin.">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:title" content="Installer Windows 10 à côté d&#x27;Ubuntu, Linux Mint ou Debian sans clé USB | linwin">
+<meta property="og:description" content="Ajouter Windows 10 en dual-boot à un Ubuntu, Linux Mint ou Debian existant, sans clé USB : place disponible (ext4), GRUB, pilotes, étapes avec linwin.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Accueil",
+          "item": "https://2deathadder.github.io/linwin/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Guides",
+          "item": "https://2deathadder.github.io/linwin/guides/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "Windows 10 à côté d'Ubuntu, Linux Mint ou Debian, sans clé USB",
+          "item": "https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/"
+        }
+      ]
+    },
+    {
+      "@type": "TechArticle",
+      "headline": "Windows 10 à côté d'Ubuntu, Linux Mint ou Debian, sans clé USB",
+      "description": "Ajouter Windows 10 en dual-boot à un Ubuntu, Linux Mint ou Debian existant, sans clé USB : place disponible (ext4), GRUB, pilotes, étapes avec linwin.",
+      "inLanguage": "fr",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "author": {
+        "@type": "Person",
+        "name": "2Deathadder",
+        "url": "https://github.com/2Deathadder"
+      },
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "mainEntityOfPage": "https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/",
+      "about": {
+        "@id": "https://2deathadder.github.io/linwin/#app"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="../../">linwin</a>
+    <nav>
+      <a href="../../">Accueil</a>
+      <a href="../../guides/">Guides</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      <a href="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/" hreflang="en" lang="en">English</a>
+    </nav>
+  </header>
+  <main class="article">
+    <h1>Windows 10 à côté d&#x27;Ubuntu, Linux Mint ou Debian, sans clé USB</h1>
+
+<p>Ubuntu, Linux Mint et Debian s'installent par défaut avec une racine <strong>ext4</strong> et le chargeur
+<strong>GRUB</strong>. linwin gère cette configuration ; le seul point d'attention est la place disponible.</p>
+
+<h2>1. Vérifier la place</h2>
+<p>ext4 ne peut pas être réduit pendant que Linux tourne. linwin utilise donc <strong>l'espace non alloué</strong>
+du disque. Vérifie ce qui est disponible :</p>
+<pre><code>linwin check</code></pre>
+<p>La ligne « Espace non alloué » indique la taille maximale possible pour Windows. Si elle est insuffisante,
+démarre une fois sur un système live (par exemple la clé d'installation d'Ubuntu, avec GParted) pour réduire la
+partition Linux, puis relance linwin : il utilisera l'espace libéré. Aucune partition existante n'est modifiée par
+linwin dans ce mode.</p>
+
+<h2>2. Installer linwin</h2>
+<pre><code>sudo apt install git
+git clone https://github.com/2Deathadder/linwin.git
+cd linwin
+sudo ./linwin install</code></pre>
+<p>Les outils manquants (<code>wimtools</code>, <code>cabextract</code>, <code>dosfstools</code>,
+<code>efibootmgr</code>) s'installent automatiquement avec apt. L'interface graphique fonctionne à partir d'Ubuntu
+24.04 et Debian 13 (paquets <code>python3-gi gir1.2-gtk-4.0 gir1.2-adw-1</code>) ; sinon, la ligne de commande fait
+exactement la même chose.</p>
+
+<h2>3. Installer Windows</h2>
+<pre><code>sudo linwin prepare --size 100G
+sudo linwin stage --iso ~/Téléchargements/Win10_22H2_French_x64v1.iso --edition Home --user moi
+sudo linwin boot
+sudo reboot</code></pre>
+
+<h2>4. Le menu GRUB</h2>
+<p>Ubuntu masque le menu GRUB quand il ne connaît qu'un système. Après l'installation, linwin ajoute une entrée
+<strong>Windows</strong> à GRUB (<code>/etc/grub.d/35_linwin_windows</code>), réactive l'affichage du menu
+(5 secondes) et régénère la configuration avec <code>update-grub</code>. Ubuntu reste le choix par défaut.</p>
+
+<h2>Wi-Fi sous Windows</h2>
+<p>Les portables récents ont souvent une carte Wi-Fi Intel AX2xx, MediaTek MT79xx ou Realtek RTL8852 que Windows 10
+ne connaît pas. linwin ajoute le pilote du catalogue Microsoft Update pour chaque carte réseau : Windows a Internet
+dès le premier démarrage.</p>
+
+    <section>
+      <p>linwin est libre (GPL-3.0) et fonctionne sur toutes les distributions courantes.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Télécharger linwin v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      </div>
+    </section>
+  </main>
+  <footer>linwin v1 — logiciel libre sous licence GPL-3.0, par 2Deathadder. linwin n'est affilié ni à Microsoft ni à Intel. <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a></footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install Windows 10 alongside Ubuntu, Linux Mint or Debian without a USB drive | linwin</title>
+<meta name="description" content="Add Windows 10 as a dual-boot to an existing Ubuntu, Linux Mint or Debian without a USB stick: free space (ext4), GRUB, drivers and steps with linwin.">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="en_US">
+<meta property="og:title" content="Install Windows 10 alongside Ubuntu, Linux Mint or Debian without a USB drive | linwin">
+<meta property="og:description" content="Add Windows 10 as a dual-boot to an existing Ubuntu, Linux Mint or Debian without a USB stick: free space (ext4), GRUB, drivers and steps with linwin.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../../../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://2deathadder.github.io/linwin/en/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Guides",
+          "item": "https://2deathadder.github.io/linwin/en/guides/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "Windows 10 alongside Ubuntu, Linux Mint or Debian, without a USB drive",
+          "item": "https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/"
+        }
+      ]
+    },
+    {
+      "@type": "TechArticle",
+      "headline": "Windows 10 alongside Ubuntu, Linux Mint or Debian, without a USB drive",
+      "description": "Add Windows 10 as a dual-boot to an existing Ubuntu, Linux Mint or Debian without a USB stick: free space (ext4), GRUB, drivers and steps with linwin.",
+      "inLanguage": "en",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "author": {
+        "@type": "Person",
+        "name": "2Deathadder",
+        "url": "https://github.com/2Deathadder"
+      },
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "mainEntityOfPage": "https://2deathadder.github.io/linwin/en/guides/ubuntu-mint-debian/",
+      "about": {
+        "@id": "https://2deathadder.github.io/linwin/#app"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="../../">linwin</a>
+    <nav>
+      <a href="../../">Home</a>
+      <a href="../../guides/">Guides</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manual (French)</a>
+      <a href="https://2deathadder.github.io/linwin/guides/ubuntu-mint-debian/" hreflang="fr" lang="fr">Français</a>
+    </nav>
+  </header>
+  <main class="article">
+    <h1>Windows 10 alongside Ubuntu, Linux Mint or Debian, without a USB drive</h1>
+
+<p>Ubuntu, Linux Mint and Debian install by default with an <strong>ext4</strong> root and the <strong>GRUB</strong>
+boot loader. linwin supports this setup; the only thing to check is the available space.</p>
+
+<h2>1. Check the space</h2>
+<p>ext4 cannot be shrunk while Linux is running, so linwin uses the disk's <strong>unallocated space</strong>.
+Check what is available:</p>
+<pre><code>linwin check</code></pre>
+<p>The “unallocated space” line shows the maximum possible Windows size. If it is too small, boot once into a live
+system (for example the Ubuntu install stick, with GParted) to shrink the Linux partition, then run linwin again: it
+will use the freed space. In this mode linwin does not modify any existing partition.</p>
+
+<h2>2. Install linwin</h2>
+<pre><code>sudo apt install git
+git clone https://github.com/2Deathadder/linwin.git
+cd linwin
+sudo ./linwin install</code></pre>
+<p>Missing tools (<code>wimtools</code>, <code>cabextract</code>, <code>dosfstools</code>, <code>efibootmgr</code>)
+are installed automatically with apt. The graphical interface works on Ubuntu 24.04+ and Debian 13+ (packages
+<code>python3-gi gir1.2-gtk-4.0 gir1.2-adw-1</code>); otherwise the command line does exactly the same.</p>
+
+<h2>3. Install Windows</h2>
+<pre><code>sudo linwin prepare --size 100G
+sudo linwin stage --iso ~/Downloads/Win10_22H2_English_x64v1.iso --edition Home --user me
+sudo linwin boot
+sudo reboot</code></pre>
+
+<h2>4. The GRUB menu</h2>
+<p>Ubuntu hides the GRUB menu when it only knows one system. After installation, linwin adds a
+<strong>Windows</strong> entry to GRUB (<code>/etc/grub.d/35_linwin_windows</code>), shows the menu again
+(5 seconds) and regenerates the configuration with <code>update-grub</code>. Ubuntu stays the default.</p>
+
+<h2>Wi-Fi in Windows</h2>
+<p>Recent laptops often have an Intel AX2xx, MediaTek MT79xx or Realtek RTL8852 Wi-Fi card that Windows 10 does not
+know. linwin adds the Microsoft Update Catalog driver for every network card, so Windows is online on first boot.</p>
+
+    <section>
+      <p>linwin is free software (GPL-3.0) and works on all common distributions.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Download linwin v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Manual (French)</a>
+      </div>
+    </section>
+  </main>
+  <footer>linwin v1 — free software under the GPL-3.0 license, by 2Deathadder. linwin is not affiliated with Microsoft or Intel. <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a></footer>
+</div>
+</body>
+</html>

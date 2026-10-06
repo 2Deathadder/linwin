@@ -29,6 +29,8 @@ Typical CLI flow: `linwin plan --size 100G` → `sudo linwin prepare --size 100G
 
 ## Docs
 
+- [Full text for LLMs (summary + complete manual)](https://2deathadder.github.io/linwin/llms-full.txt)
+- [Guides (English)](https://2deathadder.github.io/linwin/en/guides/): dual-boot without USB, Ubuntu/Mint/Debian, Intel VMD/RST SSD not detected, adding Windows to GRUB/systemd-boot/Limine
 - [User manual (French)](https://github.com/2Deathadder/linwin/blob/main/README.md): compatibility, installation, GUI and CLI walkthrough, troubleshooting, command reference
 - [Website (English)](https://2deathadder.github.io/linwin/en/)
 - [Website (French)](https://2deathadder.github.io/linwin/)

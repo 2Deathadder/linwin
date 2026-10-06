@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ajouter Windows au menu GRUB, systemd-boot, Limine ou rEFInd | linwin</title>
+<meta name="description" content="Faire apparaître Windows dans le menu de démarrage de Linux : entrée GRUB (chainloader), systemd-boot, Limine et rEFInd, menu caché, ordre UEFI. Automatique avec linwin.">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/guides/ajouter-windows-grub-systemd-boot-limine/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/guides/ajouter-windows-grub-systemd-boot-limine/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/guides/ajouter-windows-grub-systemd-boot-limine/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/guides/ajouter-windows-grub-systemd-boot-limine/">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:title" content="Ajouter Windows au menu GRUB, systemd-boot, Limine ou rEFInd | linwin">
+<meta property="og:description" content="Faire apparaître Windows dans le menu de démarrage de Linux : entrée GRUB (chainloader), systemd-boot, Limine et rEFInd, menu caché, ordre UEFI. Automatique avec linwin.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/guides/ajouter-windows-grub-systemd-boot-limine/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Accueil",
+          "item": "https://2deathadder.github.io/linwin/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Guides",
+          "item": "https://2deathadder.github.io/linwin/guides/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "Ajouter Windows au menu de démarrage : GRUB, systemd-boot, Limine, rEFInd",
+          "item": "https://2deathadder.github.io/linwin/guides/ajouter-windows-grub-systemd-boot-limine/"
+        }
+      ]
+    },
+    {
+      "@type": "TechArticle",
+      "headline": "Ajouter Windows au menu de démarrage : GRUB, systemd-boot, Limine, rEFInd",
+      "description": "Faire apparaître Windows dans le menu de démarrage de Linux : entrée GRUB (chainloader), systemd-boot, Limine et rEFInd, menu caché, ordre UEFI. Automatique avec linwin.",
+      "inLanguage": "fr",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "author": {
+        "@type": "Person",
+        "name": "2Deathadder",
+        "url": "https://github.com/2Deathadder"
+      },
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "mainEntityOfPage": "https://2deathadder.github.io/linwin/guides/ajouter-windows-grub-systemd-boot-limine/",
+      "about": {
+        "@id": "https://2deathadder.github.io/linwin/#app"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="../../">linwin</a>
+    <nav>
+      <a href="../../">Accueil</a>
+      <a href="../../guides/">Guides</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      <a href="https://2deathadder.github.io/linwin/en/guides/ajouter-windows-grub-systemd-boot-limine/" hreflang="en" lang="en">English</a>
+    </nav>
+  </header>
+  <main class="article">
+    <h1>Ajouter Windows au menu de démarrage : GRUB, systemd-boot, Limine, rEFInd</h1>
+
+<p>Après l'installation de Windows, deux problèmes reviennent souvent : Windows prend la première place au démarrage,
+et il n'apparaît pas dans le menu du chargeur de Linux. Voici comment chaque chargeur le gère, et ce que linwin fait
+automatiquement.</p>
+
+<h2>Remettre Linux en premier</h2>
+<p>Windows se place en tête de l'ordre UEFI. Pour remettre le chargeur de Linux en premier :</p>
+<pre><code>efibootmgr                         # repère le numéro de l'entrée Linux (ex. 0003)
+sudo efibootmgr --bootorder 0003,0001</code></pre>
+<p>linwin le fait des deux côtés : Windows s'enlève lui-même de la tête de liste à sa première session
+(<code>bcdedit</code>), et linwin remet l'entrée qui a démarré Linux en premier.</p>
+
+<h2>GRUB (Ubuntu, Debian, Mint, Fedora, openSUSE…)</h2>
+<p>Sans <code>os-prober</code> activé, GRUB ne détecte pas Windows. Entrée explicite, indépendante d'os-prober :</p>
+<pre><code>menuentry 'Windows' --class windows {
+	insmod part_gpt
+	insmod fat
+	insmod chain
+	search --no-floppy --fs-uuid --set=root UUID-DE-LA-PARTITION-EFI
+	chainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}</code></pre>
+<p>linwin l'écrit dans <code>/etc/grub.d/35_linwin_windows</code>, réactive le menu s'il est caché
+(<code>GRUB_TIMEOUT_STYLE=hidden</code> sur Ubuntu, <code>menu_auto_hide</code> sur Fedora) et régénère la
+configuration (<code>update-grub</code> ou <code>grub-mkconfig</code>/<code>grub2-mkconfig</code>).</p>
+
+<h2>systemd-boot</h2>
+<p>systemd-boot affiche tout seul Windows s'il est sur la même partition EFI. Le menu reste caché si
+<code>timeout</code> vaut 0 : linwin règle <code>timeout 5</code> dans <code>loader/loader.conf</code>.</p>
+
+<h2>Limine</h2>
+<p>Limine n'ajoute pas Windows automatiquement. Avec <code>limine-entry-tool</code> (Arch, CachyOS, Omarchy) :</p>
+<pre><code>sudo limine-entry-tool --add-efi "Windows" /boot/EFI/Microsoft/Boot/bootmgfw.efi</code></pre>
+<p>Sinon, une entrée dans <code>limine.conf</code> avec <code>protocol: efi</code> et
+<code>path: boot():/EFI/Microsoft/Boot/bootmgfw.efi</code>. linwin utilise l'outil s'il est présent, sinon écrit
+l'entrée.</p>
+
+<h2>rEFInd</h2>
+<p>rEFInd détecte Windows tout seul : rien à faire.</p>
+
+<p>Pour tout faire automatiquement, installation de Windows comprise : voir le
+<a href="../dual-boot-sans-cle-usb/">guide du dual-boot sans clé USB</a>.</p>
+
+    <section>
+      <p>linwin est libre (GPL-3.0) et fonctionne sur toutes les distributions courantes.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Télécharger linwin v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      </div>
+    </section>
+  </main>
+  <footer>linwin v1 — logiciel libre sous licence GPL-3.0, par 2Deathadder. linwin n'est affilié ni à Microsoft ni à Intel. <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a></footer>
+</div>
+</body>
+</html>

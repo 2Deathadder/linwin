@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Windows 10 installer doesn&#x27;t see the SSD (Intel VMD / RST): fix without BIOS changes | linwin</title>
+<meta name="description" content="“We couldn&#x27;t find any drives” when installing Windows 10: the SSD sits behind Intel VMD/RST. How to add the iaStorVD driver without touching the BIOS, automatically with linwin.">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="en_US">
+<meta property="og:title" content="Windows 10 installer doesn&#x27;t see the SSD (Intel VMD / RST): fix without BIOS changes | linwin">
+<meta property="og:description" content="“We couldn&#x27;t find any drives” when installing Windows 10: the SSD sits behind Intel VMD/RST. How to add the iaStorVD driver without touching the BIOS, automatically with linwin.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../../../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://2deathadder.github.io/linwin/en/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Guides",
+          "item": "https://2deathadder.github.io/linwin/en/guides/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "Windows 10 setup can't find the SSD: Intel VMD and the RST driver",
+          "item": "https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/"
+        }
+      ]
+    },
+    {
+      "@type": "TechArticle",
+      "headline": "Windows 10 setup can't find the SSD: Intel VMD and the RST driver",
+      "description": "“We couldn't find any drives” when installing Windows 10: the SSD sits behind Intel VMD/RST. How to add the iaStorVD driver without touching the BIOS, automatically with linwin.",
+      "inLanguage": "en",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "author": {
+        "@type": "Person",
+        "name": "2Deathadder",
+        "url": "https://github.com/2Deathadder"
+      },
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "mainEntityOfPage": "https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/",
+      "about": {
+        "@id": "https://2deathadder.github.io/linwin/#app"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="../../">linwin</a>
+    <nav>
+      <a href="../../">Home</a>
+      <a href="../../guides/">Guides</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manual (French)</a>
+      <a href="https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/" hreflang="fr" lang="fr">Français</a>
+    </nav>
+  </header>
+  <main class="article">
+    <h1>Windows 10 setup can&#x27;t find the SSD: Intel VMD and the RST driver</h1>
+
+<h2>The symptom</h2>
+<p>During Windows 10 setup, the “Where do you want to install Windows?” screen is empty and says <em>“We couldn't
+find any drives. To get a storage driver, click Load driver.”</em> Yet the SSD works fine in Linux.</p>
+
+<h2>The cause: Intel VMD</h2>
+<p>On most Intel PCs from 11th gen onwards (Alder Lake, Raptor Lake, Meteor Lake…), the NVMe SSD sits behind the
+<strong>Intel VMD</strong> (Volume Management Device) controller, handled by the <strong>Intel RST</strong> driver
+(<code>iaStorVD</code>). Linux has this driver; the Windows 10 installer does not. Many BIOSes cannot disable VMD,
+and doing so can break an existing Windows install.</p>
+<p>To check whether your PC is affected, on Linux:</p>
+<pre><code>ls /sys/bus/pci/drivers/vmd/</code></pre>
+<p>If a device address shows up (for example <code>10000:e0:06.0</code>), VMD is active.</p>
+
+<h2>The manual fix</h2>
+<ol>
+<li>Download the Intel RST installer for your controller and extract the “F6” driver (<code>iaStorVD.inf</code>,
+<code>.sys</code>, <code>.cat</code> and every file the INF copies);</li>
+<li>copy them to the install stick;</li>
+<li>in setup: <em>Load driver</em> → <em>Browse</em> → driver folder.</li>
+</ol>
+<p>Common pitfall: if a single file required by the INF is missing, Windows says the driver is “not compatible”.</p>
+
+<h2>The automatic fix with linwin</h2>
+<p>linwin detects VMD and downloads Intel RST 20.2.6.1025 from Intel (pinned SHA-256 checksums) for controllers
+467F, A77F, 7D0B and AD0B (12th–14th gen, Core Ultra), or the Microsoft Update Catalog driver for others (for example
+9A0B on 11th gen). It adds it:</p>
+<ul>
+<li>to the installer environment, which loads it before looking for disks;</li>
+<li>to the installed Windows, so it can then boot from that SSD.</li>
+</ul>
+<p>No BIOS change and no USB stick: see the <a href="../dual-boot-sans-cle-usb/">complete guide</a>.</p>
+
+    <section>
+      <p>linwin is free software (GPL-3.0) and works on all common distributions.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Download linwin v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Manual (French)</a>
+      </div>
+    </section>
+  </main>
+  <footer>linwin v1 — free software under the GPL-3.0 license, by 2Deathadder. linwin is not affiliated with Microsoft or Intel. <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a></footer>
+</div>
+</body>
+</html>

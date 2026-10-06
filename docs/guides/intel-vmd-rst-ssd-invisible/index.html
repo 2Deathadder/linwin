@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L&#x27;installeur Windows 10 ne voit pas le SSD (Intel VMD / RST) : solution sans BIOS | linwin</title>
+<meta name="description" content="« Aucun lecteur n&#x27;a été trouvé » à l&#x27;installation de Windows 10 : le SSD est derrière Intel VMD/RST. Comment ajouter le pilote iaStorVD sans toucher au BIOS, automatiquement avec linwin.">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/">
+<meta name="robots" content="index, follow">
+<meta name="google-site-verification" content="6x_nVg5ShqfbiN6l9bb-sRWy_I1lIZ5-ergKv65XdYc" />
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:title" content="L&#x27;installeur Windows 10 ne voit pas le SSD (Intel VMD / RST) : solution sans BIOS | linwin">
+<meta property="og:description" content="« Aucun lecteur n&#x27;a été trouvé » à l&#x27;installation de Windows 10 : le SSD est derrière Intel VMD/RST. Comment ajouter le pilote iaStorVD sans toucher au BIOS, automatiquement avec linwin.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Accueil",
+          "item": "https://2deathadder.github.io/linwin/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Guides",
+          "item": "https://2deathadder.github.io/linwin/guides/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "L'installeur Windows 10 ne voit pas le SSD : Intel VMD et pilote RST",
+          "item": "https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/"
+        }
+      ]
+    },
+    {
+      "@type": "TechArticle",
+      "headline": "L'installeur Windows 10 ne voit pas le SSD : Intel VMD et pilote RST",
+      "description": "« Aucun lecteur n'a été trouvé » à l'installation de Windows 10 : le SSD est derrière Intel VMD/RST. Comment ajouter le pilote iaStorVD sans toucher au BIOS, automatiquement avec linwin.",
+      "inLanguage": "fr",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "author": {
+        "@type": "Person",
+        "name": "2Deathadder",
+        "url": "https://github.com/2Deathadder"
+      },
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "mainEntityOfPage": "https://2deathadder.github.io/linwin/guides/intel-vmd-rst-ssd-invisible/",
+      "about": {
+        "@id": "https://2deathadder.github.io/linwin/#app"
+      }
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="../../">linwin</a>
+    <nav>
+      <a href="../../">Accueil</a>
+      <a href="../../guides/">Guides</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      <a href="https://2deathadder.github.io/linwin/en/guides/intel-vmd-rst-ssd-invisible/" hreflang="en" lang="en">English</a>
+    </nav>
+  </header>
+  <main class="article">
+    <h1>L&#x27;installeur Windows 10 ne voit pas le SSD : Intel VMD et pilote RST</h1>
+
+<h2>Le symptôme</h2>
+<p>Pendant l'installation de Windows 10, l'écran « Où souhaitez-vous installer Windows ? » est vide, avec le message
+<em>« Aucun lecteur n'a été trouvé. Cliquez sur Charger un pilote… »</em>. Le SSD fonctionne pourtant sous Linux.</p>
+
+<h2>La cause : Intel VMD</h2>
+<p>Sur la plupart des PC Intel de 11e génération et plus récents (Alder Lake, Raptor Lake, Meteor Lake…), le SSD
+NVMe est placé derrière le contrôleur <strong>Intel VMD</strong> (Volume Management Device), géré par le pilote
+<strong>Intel RST</strong> (<code>iaStorVD</code>). Linux a ce pilote ; l'installeur de Windows 10, non. Beaucoup de
+BIOS ne permettent pas de désactiver VMD, ou cela casse le démarrage d'un Windows existant.</p>
+<p>Pour savoir si ton PC est concerné, sous Linux :</p>
+<pre><code>ls /sys/bus/pci/drivers/vmd/</code></pre>
+<p>Si un identifiant de périphérique s'affiche (par exemple <code>10000:e0:06.0</code>), VMD est actif.</p>
+
+<h2>La solution manuelle</h2>
+<ol>
+<li>Télécharger l'installeur Intel RST correspondant au contrôleur et en extraire le pilote « F6 »
+(<code>iaStorVD.inf</code>, <code>.sys</code>, <code>.cat</code> et les fichiers que l'INF copie) ;</li>
+<li>les copier sur la clé d'installation ;</li>
+<li>dans l'installeur : <em>Charger un pilote</em> → <em>Parcourir</em> → dossier du pilote.</li>
+</ol>
+<p>Piège fréquent : si un seul fichier exigé par l'INF manque, Windows répond que le pilote « n'est pas compatible ».</p>
+
+<h2>La solution automatique avec linwin</h2>
+<p>linwin détecte VMD, télécharge le pilote Intel RST 20.2.6.1025 chez Intel (empreintes SHA-256 vérifiées) pour les
+contrôleurs 467F, A77F, 7D0B et AD0B (12e à 14e génération, Core Ultra), ou le pilote du catalogue Microsoft Update
+pour les autres (par exemple 9A0B en 11e génération). Il l'ajoute :</p>
+<ul>
+<li>à l'environnement de l'installeur, qui le charge avant de chercher le disque ;</li>
+<li>au Windows installé, pour qu'il démarre ensuite sur ce SSD.</li>
+</ul>
+<p>Rien à changer dans le BIOS, et pas de clé USB : voir le <a href="../dual-boot-sans-cle-usb/">guide complet</a>.</p>
+
+    <section>
+      <p>linwin est libre (GPL-3.0) et fonctionne sur toutes les distributions courantes.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Télécharger linwin v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      </div>
+    </section>
+  </main>
+  <footer>linwin v1 — logiciel libre sous licence GPL-3.0, par 2Deathadder. linwin n'est affilié ni à Microsoft ni à Intel. <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a></footer>
+</div>
+</body>
+</html>

@@ -69,3 +69,11 @@ a { color: var(--accent); }
   header.top { flex-direction: column; align-items: flex-start; }
   .lead { font-size: 18px; }
 }
+main.article { padding: 32px 0; max-width: 780px; }
+main.article h1 { font-size: clamp(30px, 5vw, 42px); }
+main.article h2 { font-size: 24px; margin: 32px 0 12px; }
+main.article ul, main.article ol { padding-left: 22px; }
+main.article li { margin-bottom: 6px; }
+main.article section { margin-top: 32px; }
+.card h3 a { color: var(--fg); text-decoration: none; }
+.card h3 a:hover { text-decoration: underline; }
