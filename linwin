@@ -1,0 +1,2445 @@
+#!/usr/bin/env bash
+# linwin v1 — installe Windows 10 en dual-boot natif depuis Linux, sans clé USB.
+#
+# Principe : on trouve de la place sur le disque de la partition EFI — de l'espace
+# non alloué (n'importe quelle distribution, n'importe quel système de fichiers),
+# sinon en réduisant à chaud une racine Btrfs (éventuellement dans LUKS) — et on y
+# crée une MSR, une partition cible Windows et une petite partition FAT32
+# « WINSETUP » qui joue le rôle de clé USB. On y copie l'ISO, puis une entrée UEFI
+# à usage unique (BootNext) démarre l'installeur Windows.
+#
+# Exigences : PC x86-64 en UEFI 64 bits, disque GPT à secteurs de 512 octets.
+# Distributions : pacman, apt, dnf, zypper, xbps, apk ou emerge pour les outils
+# manquants ; finalisation automatique avec systemd ou OpenRC. Chargeurs
+# reconnus : GRUB, systemd-boot, Limine, rEFInd (sinon : menu de démarrage UEFI).
+#
+# Étapes :  check → plan → iso → prepare → stage → boot → (installer Windows) → finish
+set -euo pipefail
+
+VERSION=1
+STATE_DIR=/var/lib/linwin
+STATE=$STATE_DIR/state
+MIB=2048                 # secteurs de 512 octets par Mio
+MSR_MIB=16
+MARGIN_MIB=1024          # Btrfs est réduit 1 Gio de plus que nécessaire, puis regrossi
+HEADROOM_GIB=20          # espace Btrfs non alloué qui doit rester après réduction
+ALIGN_SECTORS=2048       # partitions alignées sur 1 Mio
+TYPE_ESP=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+STAGE_DEFAULT=8G
+TYPE_MSR=E3C9E316-0B5C-4DB8-817D-F92DF00215AE
+TYPE_BASIC=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+STAGE_LABEL=WINSETUP
+TAG=linwin.tag         # repère de WINSETUP pour start.cmd (journal)
+EFI_LABEL="Windows 10 Setup (linwin)"
+WIN10_PAGE=https://www.microsoft.com/fr-fr/software-download/windows10ISO
+UA="Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+
+# Copie de confiance (root:root, non modifiable par l'utilisateur), installée par
+# « install ». L'interface graphique ne lance que celle-ci en root.
+INSTALL_DIR=/usr/local/lib/linwin
+INSTALLED_BIN=$INSTALL_DIR/linwin
+AUTO_UNIT=/etc/systemd/system/linwin-finish.service
+AUTO_OPENRC=/etc/local.d/linwin-finish.start   # équivalent pour OpenRC (service « local »)
+GRUB_SCRIPT=/etc/grub.d/35_linwin_windows       # entrée Windows pour GRUB (chainloader)
+DRV_CACHE=$STATE_DIR/drivers                    # pilotes du catalogue Microsoft Update
+LOCK=/run/linwin.lock
+RUN_LOG=/run/linwin.log   # sortie de l'opération en cours (mode --progress)
+LEGACY=win-dualboot          # ancien nom du projet (avant la v1) : repris par « install »
+LEGACY_EFI_LABEL="Windows 10 Setup ($LEGACY)"
+
+SELF=$(readlink -f "$0")
+
+# --- utilitaires ---------------------------------------------------------------
+
+die() { echo "ERREUR : $*" >&2; exit 1; }
+warn() { echo "ATTENTION : $*" >&2; }
+step() { echo; echo "==> $*"; }
+
+# --- progression (pour l'interface : « linwin --progress <commande> ») ------
+# Chaque phase couvre une plage du pourcentage global ; l'interface lit les lignes
+# « @@progress POURCENT LIBELLÉ ». Sans --progress, rien n'est émis.
+PROGRESS=0 PHASE_A=0 PHASE_B=0 PHASE_LABEL=""
+
+# phase DÉBUT FIN LIBELLÉ : nouvelle phase (affichée aussi comme étape « ==> »)
+phase() {
+  PHASE_A=$1 PHASE_B=$2 PHASE_LABEL=$3
+  step "$3"
+  progress 0
+}
+
+# progress N : avancement N % de la phase en cours
+progress() {
+  ((PROGRESS)) || return 0
+  local n=$1
+  ((n > 100)) && n=100
+  ((n < 0)) && n=0
+  echo "@@progress $((PHASE_A + n * (PHASE_B - PHASE_A) / 100)) $PHASE_LABEL"
+}
+
+# Filtre la sortie de wimlib/curl : « … (42%) » devient une ligne @@progress,
+# le reste passe tel quel. awk lit tout jusqu'au bout (pas de Broken pipe).
+progress_filter() {
+  if ((!PROGRESS)); then
+    cat
+    return
+  fi
+  awk -v RS='[\r\n]' -v a="$PHASE_A" -v b="$PHASE_B" -v l="$PHASE_LABEL" '
+    match($0, /\(?[0-9]+(\.[0-9]+)?%\)?/) {
+      v = substr($0, RSTART, RLENGTH); gsub(/[()%]/, "", v)
+      p = int(a + v * (b - a) / 100)
+      if (p != last) { print "@@progress " p " " l; fflush(); last = p }
+      next
+    }
+    /^[#=O -]+$/ { next }
+    length($0) { print; fflush() }'
+}
+
+# progress_size TOTAL_OCTETS POINT_DE_MONTAGE COMMANDE… : lance la commande en
+# suivant l'espace occupé sur le point de montage (copie vers WINSETUP).
+progress_size() {
+  local total=$1 mnt=$2 base used pid
+  shift 2
+  base=$(df -B1 --output=used "$mnt" | sed -n 2p)
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    used=$(df -B1 --output=used "$mnt" | sed -n 2p)
+    ((total > 0)) && progress $(((used - base) * 100 / total))
+    sleep 1
+  done
+  wait "$pid"
+  progress 100
+}
+
+# Repasse en root si besoin, puis prend le verrou : deux opérations en même temps
+# (interface + terminal) sur la table de partitions seraient catastrophiques.
+as_root() {
+  if ((EUID != 0)); then
+    ((PROGRESS)) && exec sudo -- "$SELF" --progress "$@"
+    exec sudo -- "$SELF" "$@"
+  fi
+  exec 9>"$LOCK"
+  flock -n 9 || die "une autre opération linwin est déjà en cours"
+  if ((PROGRESS)); then
+    # Toute la sortie passe aussi par $RUN_LOG : si l'interface se ferme, tee -p
+    # continue d'écrire le fichier au lieu de mourir, aucun outil ne reçoit de
+    # « Broken pipe », et une interface rouverte reprend l'affichage depuis ce fichier.
+    : >"$RUN_LOG"
+    chmod 644 "$RUN_LOG"
+    exec > >(tee -p -a "$RUN_LOG") 2>&1
+    echo "@@run $1"
+  fi
+}
+
+# Vrai si une opération tient le verrou (lu dans /proc/locks : sans prendre le
+# verrou, donc sans risque de gêner l'opération qui démarre)
+op_running() {
+  [[ -e $LOCK ]] && grep -q "FLOCK .*:$(stat -c %i "$LOCK") " /proc/locks
+}
+
+# Sur un portable, une coupure pendant le redimensionnement peut détruire Linux.
+require_ac() {
+  local s has_battery=0
+  for s in /sys/class/power_supply/*; do
+    [[ -f $s/type ]] || continue
+    case $(<"$s/type") in
+    Mains) [[ $(<"$s/online") == 1 ]] && return 0 ;;
+    Battery) has_battery=1 ;;
+    esac
+  done
+  ((!has_battery)) || die "l'ordinateur est sur batterie : branche le chargeur avant de continuer"
+}
+
+oem_license() { [[ -e /sys/firmware/acpi/tables/MSDM ]]; }
+
+# --- plateforme (distribution, firmware, chargeur) --------------------------------
+
+# Famille du gestionnaire de paquets : arch, deb, rpm, suse, void, alpine, gentoo
+pkg_family() {
+  local f
+  for f in pacman:arch apt-get:deb dnf:rpm yum:rpm zypper:suse xbps-install:void apk:alpine emerge:gentoo; do
+    command -v "${f%%:*}" >/dev/null && { echo "${f#*:}"; return 0; }
+  done
+  return 1
+}
+
+# Paquet(s) candidat(s) qui fournissent une commande, selon la famille
+pkg_names() {
+  case $1:$2 in
+  wimlib-imagex:deb) echo wimtools ;;
+  wimlib-imagex:rpm) echo wimlib-utils wimlib ;;
+  wimlib-imagex:suse) echo wimtools wimlib ;;
+  wimlib-imagex:gentoo) echo app-arch/wimlib ;;
+  wimlib-imagex:*) echo wimlib ;;
+  mkfs.fat:gentoo) echo sys-fs/dosfstools ;;
+  mkfs.fat:*) echo dosfstools ;;
+  sfdisk:deb) echo fdisk util-linux ;;
+  sfdisk:gentoo | partx:gentoo | wipefs:gentoo) echo sys-apps/util-linux ;;
+  sfdisk:* | partx:* | wipefs:*) echo util-linux ;;
+  cabextract:gentoo) echo app-arch/cabextract ;;
+  efibootmgr:gentoo) echo sys-boot/efibootmgr ;;
+  curl:gentoo) echo net-misc/curl ;;
+  python3:arch) echo python ;;
+  python3:gentoo) echo dev-lang/python ;;
+  *) echo "$1" ;;
+  esac
+}
+
+# Installe une commande manquante avec le gestionnaire de paquets (root)
+ensure_tool() {
+  local cmd=$1 fam pkg
+  command -v "$cmd" >/dev/null && return 0
+  [[ -e /run/ostree-booted ]] &&
+    die "« $cmd » manque et ce système est immuable (ostree) : installe-le (rpm-ostree install $(pkg_names "$cmd" rpm | cut -d' ' -f1)), redémarre, puis relance"
+  fam=$(pkg_family) || die "« $cmd » manque et aucun gestionnaire de paquets connu n'est présent : installe-le à la main"
+  for pkg in $(pkg_names "$cmd" "$fam"); do
+    echo "Installation du paquet $pkg (pour $cmd)…"
+    case $fam in
+    arch) pacman -S --needed --noconfirm "$pkg" ;;
+    deb) DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" ||
+      { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"; } ;;
+    rpm) if command -v dnf >/dev/null; then dnf install -y "$pkg"; else yum install -y "$pkg"; fi ;;
+    suse) zypper --non-interactive install "$pkg" ;;
+    void) xbps-install -Sy "$pkg" ;;
+    alpine) apk add "$pkg" ;;
+    gentoo) emerge --noreplace "$pkg" ;;
+    esac >&2 || true
+    hash -r
+    command -v "$cmd" >/dev/null && return 0
+  done
+  die "impossible d'installer « $cmd » (paquet $(pkg_names "$cmd" "$fam" | sed 's/ / ou /g')) : installe-le à la main puis relance"
+}
+
+# Affiche la raison pour laquelle ce PC ne convient pas (code 1 : il convient)
+platform_problem() {
+  [[ $(uname -m) == x86_64 ]] || { echo "processeur $(uname -m) : il faut un PC x86-64 pour Windows 10 x64"; return 0; }
+  [[ -d /sys/firmware/efi ]] || { echo "Linux a démarré en mode BIOS (Legacy/CSM) : linwin exige un démarrage UEFI"; return 0; }
+  [[ $(cat /sys/firmware/efi/fw_platform_size 2>/dev/null || echo 64) == 64 ]] ||
+    { echo "firmware UEFI 32 bits : l'installeur Windows x64 ne peut pas y démarrer"; return 0; }
+  return 1
+}
+
+# Partition EFI montée : ESP_DIR, ESP_DEV, ESP_DISK (code 1 si introuvable)
+find_esp() {
+  local mp dev type
+  ESP_DIR="" ESP_DEV="" ESP_DISK=""
+  # /efi et /boot/efi sont parfois des montages automatiques : un accès les déclenche
+  ls /efi /boot/efi /boot >/dev/null 2>&1 || true
+  for mp in /boot/efi /efi /boot $(findmnt -rno TARGET -t vfat 2>/dev/null); do
+    [[ $(findmnt -no FSTYPE -M "$mp" 2>/dev/null) == vfat ]] || continue
+    dev=$(readlink -f "$(findmnt -no SOURCE -M "$mp")")
+    type=$(lsblk -dno PARTTYPE "$dev" 2>/dev/null | tr a-f A-F)
+    [[ $type == "$TYPE_ESP" || -d $mp/EFI ]] || continue
+    [[ -f /sys/class/block/${dev##*/}/partition ]] || continue
+    ESP_DIR=$mp ESP_DEV=$dev
+    ESP_DISK=$(basename "$(readlink -f "/sys/class/block/${dev##*/}/..")")
+    return 0
+  done
+  return 1
+}
+
+init_kind() {
+  if [[ -d /run/systemd/system ]]; then
+    echo systemd
+  elif [[ -d /run/openrc ]] || command -v openrc >/dev/null; then
+    echo openrc
+  else
+    echo autre
+  fi
+}
+
+distro_name() { (. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-${NAME:-Linux}}") || echo Linux; }
+
+# Entrée UEFI qui a démarré Linux (numéro hexadécimal, ex. 0003)
+boot_current() { efibootmgr 2>/dev/null | awk -F': ' '/^BootCurrent/ {print $2}'; }
+
+# Chargeur qui a démarré Linux : limine, systemd-boot, grub, refind ou inconnu.
+# D'après le chemin de l'entrée UEFI BootCurrent, sinon d'après ce qui est installé.
+boot_loader_kind() {
+  local cur line
+  cur=$(boot_current)
+  line=$( [[ -n $cur ]] && efibootmgr -v 2>/dev/null | grep -i "^Boot$cur" | tr 'A-Z' 'a-z' || true)
+  case $line in
+  *limine*) echo limine; return ;;
+  *systemd-boot* | *"linux boot manager"*) echo systemd-boot; return ;;
+  *grub* | *shim*) echo grub; return ;;
+  *refind*) echo refind; return ;;
+  esac
+  [[ -z ${ESP_DIR:-} ]] && find_esp || true
+  if [[ -n ${ESP_DIR:-} && -f $ESP_DIR/limine.conf ]] || command -v limine-update >/dev/null; then
+    echo limine
+  elif [[ -n ${ESP_DIR:-} && -f $ESP_DIR/loader/loader.conf ]]; then
+    echo systemd-boot
+  elif command -v grub-mkconfig >/dev/null || command -v grub2-mkconfig >/dev/null; then
+    echo grub
+  elif [[ -n ${ESP_DIR:-} && -d $ESP_DIR/EFI/refind ]]; then
+    echo refind
+  else
+    echo inconnu
+  fi
+}
+
+loader_label() {
+  case $1 in
+  limine) echo Limine ;; systemd-boot) echo systemd-boot ;; grub) echo GRUB ;; refind) echo rEFInd ;;
+  *) echo "le menu de démarrage UEFI" ;;
+  esac
+}
+
+# Vrai si la copie installée est sûre à lancer en root : root:root, ni elle ni
+# ses dossiers parents ne sont modifiables par un autre utilisateur.
+installed_trusted() {
+  local p=$INSTALLED_BIN
+  [[ -f $p && ! -L $p ]] || return 1
+  while :; do
+    [[ $(stat -Lc '%u' "$p") == 0 ]] && ! (($(stat -Lc '0%a' "$p") & 022)) || return 1
+    [[ $p == / ]] && return 0
+    p=$(dirname "$p")
+  done
+}
+
+# "100G" / "512M" -> Mio
+to_mib() {
+  [[ $1 =~ ^([0-9]+)([GgMm])$ ]] || die "taille invalide : $1 (ex. 100G)"
+  local n=${BASH_REMATCH[1]}
+  [[ ${BASH_REMATCH[2]} == [Gg] ]] && echo $((n * 1024)) || echo "$n"
+}
+
+gib() { awk -v s="$1" 'BEGIN { printf "%.1f Gio", s * 512 / 1073741824 }'; }
+
+# Chemin /dev d'une partition à partir du disque et du numéro (nvme0n1p3, sda3…)
+partdev() {
+  local d
+  for d in /sys/class/block/"$1"*; do
+    [[ -f $d/partition && $(<"$d/partition") == "$2" ]] && { echo "/dev/${d##*/}"; return; }
+  done
+  return 1
+}
+
+vmd_active() { compgen -G '/sys/bus/pci/drivers/vmd/[0-9a-f]*:*' >/dev/null; }
+
+# Pilote Intel RST VMD « F6 » (iaStorVD 20.2.6.1025 : contrôleurs VMD 467F, A77F,
+# 7D0B et AD0B, soit 12e à 14e gén. et Core Ultra ; PAS la 11e gén., 9A0B).
+# Intel ne publie plus le zip F6 : on prend l'installeur officiel et on en
+# extrait le zip .NET embarqué. Toutes les empreintes sont épinglées.
+RST_URL=https://downloadmirror.intel.com/865363/SetupRST.exe
+RST_SHA256=7fe68cd6e00dbde798ed895c649f5a3a31738877274dfba54dbef15546ee3dd2
+RST_CACHE=$STATE_DIR/vmd-driver
+RST_FILES=(
+  "24696802a8c8e198d572eaa721c81fa0c29e6336a1ab200bf553aa613c3681a5  iaStorVD.cat"
+  "ed5fd2234947ff6d67ef8efccae6b4be1f0aa5b65188ce40d98f927d5c0c80d0  iaStorVD.inf"
+  "7d2f5e62f6717e9df8925e29b4b8789316505cb2d8b6ea0d22104249f692b7c8  iaStorVD.sys"
+  # exigés par l'INF (CopyFiles) : sans eux, drvload et « Charger un pilote » échouent
+  "94e37b495ea2866240dcf2b8cbb949d9703c28b9b54c2027e6fbb0e30b9533e3  RstMwService.exe"
+  "27f9ae9d9c7596258b7f54d877b6f5fce7dbaf5ce9e2c03c998a029bef2417e4  RstMwEventLogMsg.dll"
+)
+
+# Identifiants PCI des contrôleurs VMD actifs (ex. A77F)
+vmd_ids() {
+  local d
+  for d in /sys/bus/pci/drivers/vmd/[0-9a-f]*:*; do
+    [[ -f $d/device ]] || continue
+    sed 's/^0x//' <"$d/device" | tr a-f A-F
+  done
+}
+
+# Vrai si un .inf du dossier gère tous les contrôleurs VMD actifs (INF en UTF-16 ou ANSI)
+driver_supports() {
+  local id text
+  # retirer les octets nuls ramène l'UTF-16 des identifiants PCI à de l'ASCII
+  text=$(find "$1" -iname '*.inf' -exec cat {} + | tr -d '\0')
+  for id in $(vmd_ids); do
+    grep -qi "VEN_8086&DEV_$id" <<<"$text" || return 1
+  done
+}
+
+# Empêche le bureau (udisks) de monter WINSETUP et démonte ce qui l'est déjà :
+# mkfs.fat refuse une partition montée. Règle dans /run : disparaît au redémarrage.
+release_stage_dev() {
+  local t
+  mkdir -p /run/udev/rules.d
+  printf '%s\n' "ENV{ID_FS_LABEL}==\"$STAGE_LABEL\", ENV{UDISKS_IGNORE}=\"1\", ENV{UDISKS_AUTO}=\"0\"" \
+    "KERNEL==\"${1##*/}\", ENV{UDISKS_IGNORE}=\"1\", ENV{UDISKS_AUTO}=\"0\"" >/run/udev/rules.d/90-linwin.rules
+  udevadm control --reload || true
+  udevadm trigger --settle "$1" 2>/dev/null || true
+  while t=$(findmnt -rno TARGET -S "$1" | sed -n 1p) && [[ -n $t ]]; do
+    umount "$t" || die "impossible de démonter $1 ($t) : ferme les fenêtres qui l'utilisent"
+  done
+}
+
+rst_cached() { [[ -d $RST_CACHE ]] && (cd "$RST_CACHE" && printf '%s\n' "${RST_FILES[@]}" | sha256sum -c --quiet) >/dev/null 2>&1; }
+
+# Télécharge et extrait le pilote dans $RST_CACHE (si absent ou altéré)
+fetch_rst_driver() {
+  rst_cached && return
+  local tmp
+  tmp=$(mktemp -d)
+  curl -fL --retry 3 --progress-bar -A "$UA" -o "$tmp/SetupRST.exe" "$RST_URL" 2>&1 | progress_filter ||
+    { rm -rf "$tmp"; die "téléchargement impossible : $RST_URL"; }
+  echo "$RST_SHA256  $tmp/SetupRST.exe" | sha256sum -c --quiet || { rm -rf "$tmp"; die "SetupRST.exe n'a pas l'empreinte attendue"; }
+  python3 - "$tmp/SetupRST.exe" "$tmp/out" <<'EOF' || { rm -rf "$tmp"; die "pilote introuvable dans SetupRST.exe"; }
+import io, os, sys, zipfile
+data, out = open(sys.argv[1], "rb").read(), sys.argv[2]
+end = 0
+while (end := data.find(b"PK\x05\x06", end + 1)) > 0:
+    size, off = int.from_bytes(data[end + 12:end + 16], "little"), int.from_bytes(data[end + 16:end + 20], "little")
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data[end - size - off:end + 22]))
+    except zipfile.BadZipFile:
+        continue
+    if "iaStorVD.inf" in z.namelist():
+        os.makedirs(out)
+        z.extractall(out)  # tout le paquet F6 : l'INF copie aussi RstMwService.exe et sa DLL
+        sys.exit(0)
+sys.exit(1)
+EOF
+  (cd "$tmp/out" && printf '%s\n' "${RST_FILES[@]}" | sha256sum -c --quiet) || { rm -rf "$tmp"; die "fichiers du pilote altérés"; }
+  rm -rf "$RST_CACHE"
+  mkdir -p "$STATE_DIR"
+  mv "$tmp/out" "$RST_CACHE"
+  rm -rf "$tmp"
+  echo "Pilote prêt : $RST_CACHE (signé WHQL par Microsoft)"
+}
+
+# Contrôleurs VMD gérés par le pilote RST épinglé ci-dessus
+RST_VMD_IDS="467F A77F 7D0B AD0B"
+rst_covers() {
+  local id
+  for id in $(vmd_ids); do
+    [[ " $RST_VMD_IDS " == *" $id "* ]] || return 1
+  done
+}
+
+# --- pilotes du catalogue Microsoft Update ------------------------------------------
+# Windows 10 n'a pas de pilote d'origine pour beaucoup de cartes récentes (Wi-Fi
+# Intel AX2xx/BE2xx, MediaTek MT79xx, Realtek RTL8852/8922, Ethernet 2,5 Gbit/s…) :
+# sans réseau, pas de Windows Update. Le catalogue Microsoft Update publie, par
+# identifiant matériel, les pilotes signés WHQL que Windows Update distribue. On
+# choisit le plus récent qui déclare ce périphérique pour Windows 10 x64 (build
+# 19045), on vérifie le SHA-1 annoncé par Microsoft, puis Windows contrôle à son
+# tour la signature du pilote à l'installation.
+
+# Identifiant matériel PCI au format Windows : VEN_8086&DEV_51F1&SUBSYS_00948086&REV_1A
+pci_hwid() {
+  local d=$1
+  printf 'VEN_%s&DEV_%s&SUBSYS_%s%s&REV_%s\n' "$(sed 's/^0x//' <"$d/vendor")" "$(sed 's/^0x//' <"$d/device")" \
+    "$(sed 's/^0x//' <"$d/subsystem_device")" "$(sed 's/^0x//' <"$d/subsystem_vendor")" \
+    "$(sed 's/^0x//' <"$d/revision")" | tr a-f A-F
+}
+
+pci_name() {
+  local d=$1 name=""
+  command -v lspci >/dev/null && name=$(lspci -s "${d##*/}" 2>/dev/null | sed 's/^[^ ]* [^:]*: //; s/ (rev [0-9a-f]*)$//')
+  if [[ -z $name ]]; then
+    case $(<"$d/class") in
+    0x0280*) name="carte Wi-Fi" ;;
+    0x0200*) name="carte Ethernet" ;;
+    *) name="carte réseau" ;;
+    esac
+  fi
+  echo "$name"
+}
+
+# Cartes réseau PCI (Ethernet, Wi-Fi) : une ligne « HWID|nom » par carte
+net_devices() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ -f $d/class && $(<"$d/class") == 0x02* ]] || continue
+    printf '%s|%s\n' "$(pci_hwid "$d")" "$(pci_name "$d")"
+  done
+}
+
+# Dossier de cache d'un pilote : $DRV_CACHE/VEN_8086&DEV_51F1&SUBSYS_00948086
+drv_dir() { echo "$DRV_CACHE/${1%&REV_*}"; }
+drv_cached() { [[ -f $(drv_dir "$1")/linwin-source.txt ]]; }
+
+# catalog_fetch HWID CLASSE : télécharge dans drv_dir le pilote du catalogue (si absent)
+catalog_fetch() {
+  local hwid=$1 cls=${2:-} dir
+  dir=$(drv_dir "$hwid")
+  drv_cached "$hwid" && { echo "Déjà téléchargé : $(sed -n 1p "$dir/linwin-source.txt")"; return 0; }
+  ensure_tool cabextract
+  mkdir -p "$DRV_CACHE"
+  rm -rf "$dir"
+  python3 - "$dir" "PCI\\$hwid" "$cls" "$UA" <<'PY'
+import base64, hashlib, html, json, os, re, shutil, subprocess, sys, tempfile
+import urllib.parse, urllib.request
+
+out, hwid, cls, ua = sys.argv[1:5]
+CAT = "https://www.catalog.update.microsoft.com/"
+WIN10_BUILD = 19045
+
+m = re.match(r"PCI\\VEN_(\w{4})&DEV_(\w{4})(?:&SUBSYS_(\w{8}))?(?:&REV_(\w{2}))?$", hwid, re.I)
+if not m:
+    sys.exit(f"identifiant matériel illisible : {hwid}")
+ven, dev, sub, rev = (g.upper() if g else None for g in m.groups())
+base = f"PCI\\VEN_{ven}&DEV_{dev}"
+# les identifiants que Windows génère pour ce périphérique, du plus précis au plus vague
+ids = []
+if sub:
+    ids += [f"{base}&SUBSYS_{sub}&REV_{rev}", f"{base}&SUBSYS_{sub}"]
+if rev:
+    ids.append(f"{base}&REV_{rev}")
+if cls:
+    ids += [f"{base}&CC_{cls}", f"{base}&CC_{cls[:4]}"]
+ids.append(base)
+wanted = {i.upper() for i in ids}
+
+
+def get(url, data=None):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        return r.read()
+
+
+def search(q):
+    t = get(CAT + "Search.aspx?q=" + urllib.parse.quote(q)).decode("utf-8", "replace")
+    rows = []
+    for m in re.finditer(r'<tr id="([0-9a-f-]{36})_R\d+"(.*?)</tr>', t, re.S):
+        cells = [html.unescape(re.sub(r"<[^>]+>", "", c)).strip()
+                 for c in re.findall(r"<td[^>]*>(.*?)</td>", m.group(2), re.S)]
+        if len(cells) >= 6:
+            rows.append({"id": m.group(1), "title": cells[1], "products": cells[2], "version": cells[5]})
+    return rows
+
+
+def version_key(r):
+    # colonne « Version », sinon la version écrite dans le titre (« … 10.71.312.2024 »)
+    for text in (r["version"], r["title"]):
+        m = re.search(r"\d+(?:\.\d+){1,3}", text)
+        if m:
+            return tuple(int(x) for x in m.group(0).split("."))
+    return ()
+
+
+def decoded(path):
+    b = open(path, "rb").read()
+    if b[:2] == b"\xff\xfe" or (len(b) > 1 and b[1] == 0):
+        return b.decode("utf-16-le", "ignore").lstrip("﻿")
+    return b.decode("latin-1")
+
+
+def sections(text):
+    sec, cur = {}, None
+    for line in text.splitlines():
+        line = line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        h = re.match(r"^\[(.+)\]$", line)
+        if h:
+            cur = sec.setdefault(h.group(1).strip().lower(), [])
+        elif cur is not None:
+            cur.append(line)
+    return sec
+
+
+def deco_ok(deco):
+    # NTamd64[.Major[.Minor[.ProductType[.SuiteMask[.BuildNumber]]]]]
+    p = deco.strip().lower().split(".")
+    if p[0] != "ntamd64":
+        return False
+    try:
+        if len(p) > 2 and p[1] and (int(p[1]), int(p[2] or 0)) > (10, 0):
+            return False
+        if len(p) > 5 and p[5] and int(p[5]) > WIN10_BUILD:
+            return False
+    except ValueError:
+        return False
+    return True
+
+
+def inf_supports(path):
+    sec = sections(decoded(path))
+    for line in sec.get("manufacturer", []):
+        if "=" not in line:
+            continue
+        parts = [x.strip() for x in line.split("=", 1)[1].split(",")]
+        for deco in parts[1:]:
+            if not deco_ok(deco):
+                continue
+            for entry in sec.get(f"{parts[0]}.{deco}".lower(), []):
+                if "=" in entry and any(h.strip().upper() in wanted for h in entry.split("=", 1)[1].split(",")[1:]):
+                    return True
+    return False
+
+
+def files_of(uid):
+    data = urllib.parse.urlencode({"updateIDs": json.dumps(
+        [{"size": 0, "languages": "", "uidInfo": uid, "updateID": uid}])}).encode()
+    t = get(CAT + "DownloadDialog.aspx", data).decode("utf-8", "replace")
+    digests = dict(re.findall(r"files\[(\d+)\]\.digest = '([^']*)'", t))
+    return [(u, digests.get(i)) for i, u in re.findall(r"files\[(\d+)\]\.url = '([^']*)'", t)]
+
+
+# Une page de résultats ne compte que 25 lignes : on filtre la recherche sur
+# « Windows 10 », et les pilotes propres à ce modèle (SUBSYS) passent en premier.
+rows, seen = [], set()
+queries = ([f"{base}&SUBSYS_{sub} Windows 10"] if sub else []) + [f"{base} Windows 10", base]
+for q in queries:
+    try:
+        found = search(q)
+    except Exception as e:
+        print(f"catalogue injoignable : {e}", file=sys.stderr)
+        sys.exit(2)
+    batch = [r for r in found if r["id"] not in seen and re.search(r"Windows 10(?! S)", r["products"])]
+    batch.sort(key=version_key, reverse=True)
+    for r in batch:
+        seen.add(r["id"])
+        rows.append(r)
+
+tmp = tempfile.mkdtemp()
+try:
+    for r in rows[:6]:
+        for url, digest in files_of(r["id"]):
+            u = urllib.parse.urlparse(url)
+            host = u.hostname or ""
+            if not (host.endswith(".windowsupdate.com") or host.endswith(".microsoft.com")) or not digest:
+                continue
+            if not u.path.lower().endswith(".cab"):
+                continue
+            cab = os.path.join(tmp, "driver.cab")
+            data = get(urllib.parse.urlunparse(u._replace(scheme="https")))
+            if base64.b64encode(hashlib.sha1(data).digest()).decode() != digest:
+                print(f"empreinte SHA-1 incorrecte pour {url} : ignoré", file=sys.stderr)
+                continue
+            open(cab, "wb").write(data)
+            ext = os.path.join(tmp, "x")
+            shutil.rmtree(ext, ignore_errors=True)
+            os.makedirs(ext)
+            if subprocess.run(["cabextract", "-q", "-d", ext, cab], capture_output=True).returncode:
+                continue
+            infs = [os.path.join(d, f) for d, _, fs in os.walk(ext) for f in fs if f.lower().endswith(".inf")]
+            if any(inf_supports(i) for i in infs):
+                shutil.move(ext, out)
+                with open(os.path.join(out, "linwin-source.txt"), "w") as f:
+                    f.write(f"{r['title']} — version {r['version']}\n{url}\nSHA-1 {digest}\n")
+                print(f"{r['title']} — version {r['version']}")
+                sys.exit(0)
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+print(f"aucun pilote Windows 10 x64 pour {hwid} dans le catalogue Microsoft Update", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+# Télécharge les pilotes des cartes réseau. Affiche les dossiers obtenus.
+# Jamais fatal : sans pilote, Windows garde ses pilotes d'origine (souvent
+# suffisants pour l'Ethernet) et Windows Update fera le reste une fois connecté.
+fetch_net_drivers() {
+  local d id name cls
+  for d in /sys/bus/pci/devices/*; do
+    [[ -f $d/class && $(<"$d/class") == 0x02* ]] || continue
+    id=$(pci_hwid "$d") name=$(pci_name "$d") cls=$(sed 's/^0x//' <"$d/class" | tr a-f A-F)
+    echo "Pilote pour $name ($id) :" >&2
+    if catalog_fetch "$id" "$cls" >&2; then
+      drv_dir "$id"
+    else
+      warn "pas de pilote du catalogue pour $name : Windows utilisera son pilote d'origine s'il en a un"
+    fi
+  done
+}
+
+
+save_state() {
+  mkdir -p "$STATE_DIR"
+  local k
+  : >"$STATE.tmp"
+  for k in MODE DISK PART_NUM MSR_NUM WIN_NUM STAGE_NUM MSR_START WIN_START STAGE_START STAGED UNATTENDED VMD_DRIVER NET_DRIVERS STAGE_PARTUUID LINUX_BOOT; do
+    # vide reste vide (STAGE_PARTUUID, LINUX_BOOT) : load_state pose les défauts
+    printf '%s=%q\n' "$k" "${!k-}" >>"$STATE.tmp"
+  done
+  mv "$STATE.tmp" "$STATE"
+}
+
+load_state() {
+  [[ -f $STATE ]] || die "aucun état trouvé ($STATE) : lance d'abord « prepare »"
+  MODE=shrink MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  # shellcheck disable=SC1090
+  source "$STATE"
+}
+
+# --- détection du disque ---------------------------------------------------------
+
+# Windows va sur le disque de la partition EFI : c'est là que son gestionnaire de
+# démarrage s'installe. Remplit : ESP_* DISK DISK_SECTORS LAST_LBA FREE_START
+# FREE_SIZE, puis (detect_root) ROOT_* SHRINK_OK SHRINK_WHY PART PART_NUM START
+# SIZE LUKS DM_NAME OFFSET BTRFS_DEVID BTRFS_SIZE BTRFS_UNALLOC
+detect() {
+  local problem
+  if problem=$(platform_problem); then die "$problem"; fi
+  find_esp || die "partition EFI introuvable : elle doit être montée (/boot/efi, /efi ou /boot)"
+  DISK=$ESP_DISK
+  disk_label | grep -qx -e gpt -e '' ||
+    die "le disque /dev/$DISK n'est pas en GPT : Windows en UEFI exige une table GPT"
+  [[ $(<"/sys/block/$DISK/queue/logical_block_size") == 512 ]] || die "disque à secteurs logiques ≠ 512 octets : non géré"
+  DISK_SECTORS=$(<"/sys/block/$DISK/size")
+  LAST_LBA=$((DISK_SECTORS - 34))
+  find_free
+  detect_root
+}
+
+# Type de table du disque (gpt, dos…), vide si inconnu : udev d'abord (sans root),
+# puis lecture directe (root). « prepare » exige qu'il soit connu.
+disk_label() {
+  local t
+  t=$(lsblk -dno PTTYPE "/dev/$DISK" 2>/dev/null || true)
+  [[ -z $t ]] && t=$(blkid -p -s PTTYPE -o value "/dev/$DISK" 2>/dev/null || true)
+  echo "$t"
+}
+
+# Plus grande zone non allouée du disque, alignée sur 1 Mio : FREE_START, FREE_SIZE
+# (en secteurs). D'après /sys : lisible sans être root.
+find_free() {
+  local prev=$ALIGN_SECTORS s e a size d
+  FREE_START=0 FREE_SIZE=0
+  while read -r s e; do
+    a=$(((prev + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS))
+    size=$(((s - a) / ALIGN_SECTORS * ALIGN_SECTORS))
+    ((size > FREE_SIZE)) && FREE_START=$a FREE_SIZE=$size
+    ((e > prev)) && prev=$e
+  done < <(
+    for d in /sys/block/"$DISK"/"$DISK"*; do
+      [[ -f $d/start ]] && echo "$(<"$d/start") $(($(<"$d/start") + $(<"$d/size")))"
+    done | sort -n
+    echo "$((LAST_LBA + 1)) $((LAST_LBA + 1))"
+  )
+}
+
+# La racine peut-elle céder de la place à chaud ? Seulement en Btrfs (sur une
+# partition du disque de l'ESP, éventuellement dans LUKS) : ext4 ne se réduit que
+# démonté, XFS jamais. Sinon SHRINK_WHY dit pourquoi.
+detect_root() {
+  SHRINK_OK=0 SHRINK_WHY="" PART="" PART_NUM=0 START=0 SIZE=0 LUKS=0 DM_NAME="" OFFSET=0
+  BTRFS_DEVID="" BTRFS_SIZE=0 BTRFS_UNALLOC=0
+  ROOT_FS=$(findmnt -no FSTYPE /)
+  ROOT_DEV=$(readlink -f "$(findmnt -no SOURCE / | sed 's/\[.*//')")
+  local name=${ROOT_DEV##*/} slaves part="" pdisk
+  ROOT_PART=$name
+  if [[ -d /sys/block/$name/dm ]]; then
+    if [[ $(<"/sys/block/$name/dm/uuid") == CRYPT-LUKS* ]]; then
+      slaves=(/sys/block/"$name"/slaves/*)
+      if ((${#slaves[@]} == 1)); then
+        LUKS=1 DM_NAME=$(<"/sys/block/$name/dm/name") part=${slaves[0]##*/}
+        ROOT_PART=$part
+      else
+        SHRINK_WHY="la racine chiffrée s'étend sur plusieurs périphériques"
+      fi
+    else
+      SHRINK_WHY="la racine est sur LVM (ou un autre device-mapper) : réduction à chaud non gérée"
+    fi
+  elif [[ -b /dev/$name ]]; then
+    part=$name
+  else
+    SHRINK_WHY="la racine ($ROOT_FS) n'est pas sur une partition"
+  fi
+  if [[ -n $part ]]; then
+    if [[ ! -f /sys/class/block/$part/partition ]]; then
+      SHRINK_WHY="la racine est sur /dev/$part, qui n'est pas une partition"
+    else
+      pdisk=$(basename "$(readlink -f "/sys/class/block/$part/..")")
+      if [[ $pdisk != "$DISK" ]]; then
+        SHRINK_WHY="Linux est sur /dev/$pdisk, pas sur le disque de la partition EFI (/dev/$DISK)"
+      else
+        PART=$part
+        PART_NUM=$(<"/sys/class/block/$PART/partition")
+        START=$(<"/sys/class/block/$PART/start")
+        SIZE=$(<"/sys/class/block/$PART/size")
+        ((LUKS)) && OFFSET=$((SIZE - $(<"/sys/block/$name/size")))
+      fi
+    fi
+  fi
+  if [[ -z $SHRINK_WHY && $ROOT_FS != btrfs ]]; then
+    SHRINK_WHY="la racine est en $ROOT_FS : seul Btrfs se réduit pendant que Linux tourne"
+  fi
+  [[ -n $SHRINK_WHY ]] && return 0
+  BTRFS_FSID=$(findmnt -no UUID /)
+  local devs=(/sys/fs/btrfs/"$BTRFS_FSID"/devinfo/*)
+  if ((${#devs[@]} != 1)); then
+    SHRINK_WHY="Btrfs sur plusieurs périphériques : non géré"
+    return 0
+  fi
+  BTRFS_DEVID=${devs[0]##*/}
+  BTRFS_SIZE=$(btrfs filesystem usage -b / 2>/dev/null | awk '/Device size:/ {print $3}')
+  BTRFS_UNALLOC=$(btrfs filesystem usage -b / 2>/dev/null | awk '/Device unallocated:/ {print $3}')
+  if [[ $BTRFS_SIZE =~ ^[0-9]+$ && $BTRFS_UNALLOC =~ ^[0-9]+$ ]]; then
+    SHRINK_OK=1
+  else
+    SHRINK_WHY="taille Btrfs illisible"
+  fi
+}
+
+# Taille Windows maximale (Gio) de chaque source d'espace
+free_max_gib() {
+  local m=$(((FREE_SIZE / MIB - MSR_MIB - $(to_mib "$STAGE_DEFAULT")) / 1024))
+  echo $((m < 0 ? 0 : m))
+}
+shrink_max_gib() {
+  ((SHRINK_OK)) || { echo 0; return; }
+  local m=$(((BTRFS_UNALLOC / 1048576 - HEADROOM_GIB * 1024 - MARGIN_MIB - MSR_MIB - $(to_mib "$STAGE_DEFAULT") - 1024) / 1024))
+  echo $((m < 0 ? 0 : m))
+}
+
+# Calcule la géométrie pour WIN_MIB + STAGE_MIB. MODE : « free » (espace non
+# alloué, rien n'est redimensionné) de préférence, sinon « shrink » (réduction de
+# la partition Linux, les nouvelles partitions occupent la fin de son ancienne place).
+compute_plan() {
+  local need=$(((MSR_MIB + WIN_MIB + STAGE_MIB) * MIB))
+  MODE="" NEW_SIZE=$SIZE NEW_INNER=0 BTRFS_TARGET=0 SHRINK_BYTES=0
+  if [[ ${FORCE_MODE:-} != shrink ]] && ((FREE_SIZE >= need)); then
+    MODE=free
+    MSR_START=$FREE_START
+  elif [[ ${FORCE_MODE:-} != free ]] && ((SHRINK_OK)); then
+    MODE=shrink
+    NEW_SIZE=$(((SIZE - need) / MIB * MIB))
+    MSR_START=$((START + NEW_SIZE))
+    NEW_INNER=$((NEW_SIZE - OFFSET))
+    BTRFS_TARGET=$(((NEW_INNER - MARGIN_MIB * MIB) * 512))
+    SHRINK_BYTES=$((BTRFS_SIZE - BTRFS_TARGET))
+    ((SHRINK_BYTES + HEADROOM_GIB * 1073741824 <= BTRFS_UNALLOC)) ||
+      die "pas assez d'espace libre dans Btrfs : il faut $((SHRINK_BYTES / 1073741824 + HEADROOM_GIB)) Gio non alloués, il y en a $((BTRFS_UNALLOC / 1073741824))"
+  else
+    local why="il faut $((need / MIB / 1024)) Gio d'un seul tenant non alloués sur /dev/$DISK, la plus grande zone libre fait $((FREE_SIZE / MIB / 1024)) Gio"
+    ((SHRINK_OK)) || why+=", et Linux ne peut pas être réduit à chaud ($SHRINK_WHY)"
+    [[ $FORCE_MODE == free ]] && why="mode free imposé : $why"
+    die "pas assez de place : $why. Choisis une taille plus petite, ou libère de l'espace non alloué sur ce disque (par ex. en réduisant une partition depuis un système live avec GParted)."
+  fi
+  WIN_START=$((MSR_START + MSR_MIB * MIB))
+  STAGE_START=$((WIN_START + WIN_MIB * MIB))
+  STAGE_END=$((STAGE_START + STAGE_MIB * MIB - 1))
+  ((STAGE_END <= LAST_LBA)) || die "le plan dépasse la fin du disque"
+}
+
+print_plan() {
+  echo "Disque          : /dev/$DISK ($(gib "$DISK_SECTORS")), partition EFI $ESP_DEV ($ESP_DIR)"
+  if [[ $MODE == free ]]; then
+    echo "Espace utilisé  : zone non allouée de $(gib "$FREE_SIZE") — aucune partition existante n'est modifiée"
+  else
+    echo "Partition Linux : /dev/$PART (n°$PART_NUM)$( ((LUKS)) && echo " — LUKS « $DM_NAME », en-tête $((OFFSET / MIB)) Mio")"
+    echo "  taille        : $(gib "$SIZE")  →  $(gib "$NEW_SIZE")"
+    echo "  Btrfs         : réduit à $(gib $((BTRFS_TARGET / 512))) puis regrossi pour remplir la partition"
+  fi
+  echo "Nouvelles partitions$([[ $MODE == shrink ]] && echo " (à la place libérée, après la partition Linux)") :"
+  echo "  MSR           : $MSR_MIB Mio"
+  echo "  Windows       : $((WIN_MIB / 1024)) Gio   (cible de l'installation)"
+  echo "  $STAGE_LABEL      : $((STAGE_MIB / 1024)) Gio   (installeur, supprimée après l'installation)"
+}
+
+parse_sizes() {
+  WIN_MIB="" STAGE_MIB=$(to_mib "$STAGE_DEFAULT") ASSUME_YES=0 KEY_STDIN=0 FORCE_MODE=""
+  while (($#)); do
+    case $1 in
+    --yes) ASSUME_YES=1; shift ;;
+    --key-stdin) KEY_STDIN=1; shift ;;
+    --size) WIN_MIB=$(to_mib "${2:?}"); shift 2 ;;
+    --stage-size) STAGE_MIB=$(to_mib "${2:?}"); shift 2 ;;
+    --mode) FORCE_MODE=${2:?}; [[ $FORCE_MODE =~ ^(free|shrink)$ ]] || die "--mode : free ou shrink"; shift 2 ;;
+    *) die "option inconnue : $1" ;;
+    esac
+  done
+  [[ -n $WIN_MIB ]] || die "précise la taille Windows, ex. --size 100G"
+  ((WIN_MIB >= 32 * 1024)) || die "Windows 10 exige au moins 32 Gio (64 Gio ou plus conseillés)"
+  ((STAGE_MIB >= 6 * 1024)) || die "la partition $STAGE_LABEL doit faire au moins 6 Gio"
+}
+
+# --- commandes -------------------------------------------------------------------
+
+cmd_check() {
+  echo "Système : $(distro_name), init $(init_kind), paquets : $(pkg_family || echo inconnu)"
+  local problem
+  if problem=$(platform_problem); then
+    echo "PC NON COMPATIBLE : $problem"
+    return 1
+  fi
+  detect
+  echo "Partition EFI : $ESP_DEV montée sur $ESP_DIR (disque /dev/$DISK, GPT) — Windows ira sur ce disque"
+  local esp_avail
+  esp_avail=$(findmnt -bno AVAIL -M "$ESP_DIR" 2>/dev/null || echo 0)
+  echo "  $((esp_avail / 1048576)) Mio libres$( ((esp_avail >= 100 * 1048576)) && echo ", OK" || echo " — Windows a besoin d'environ 100 Mio")"
+  echo "Chargeur de Linux : $(loader_label "$(boot_loader_kind)")"
+  echo "Racine : $ROOT_FS sur /dev/$ROOT_PART$( ((LUKS)) && echo ", dans LUKS « $DM_NAME »")"
+  echo "Espace non alloué sur /dev/$DISK : $(gib "$FREE_SIZE") d'un seul tenant → Windows jusqu'à $(free_max_gib) Gio sans rien redimensionner"
+  if ((SHRINK_OK)); then
+    echo "Réduction à chaud de Linux : possible (Btrfs : $((BTRFS_SIZE / 1073741824)) Gio, dont $((BTRFS_UNALLOC / 1073741824)) non alloués) → jusqu'à $(shrink_max_gib) Gio"
+  else
+    echo "Réduction à chaud de Linux : impossible — $SHRINK_WHY"
+  fi
+  echo "Licence Windows dans le firmware : $(oem_license && echo 'oui (édition Famille en général)' || echo non)"
+  echo "Alimentation : $( (require_ac) 2>/dev/null && echo 'secteur, OK' || echo 'SUR BATTERIE — branche le chargeur')"
+  echo "Copie installée sûre : $(installed_trusted && echo "oui ($INSTALLED_BIN)" || echo "non — lance « install »")"
+  if vmd_active; then
+    echo "Intel VMD : ACTIF (contrôleur $(vmd_ids | paste -sd ' ')) — sans pilote, l'installeur Windows 10 ne verrait pas le SSD."
+    if rst_covers; then
+      echo "  → « stage » ajoutera le pilote Intel RST (iaStorVD 20.2.6.1025) à l'installeur."
+    else
+      echo "  → « stage » cherchera le pilote de ce contrôleur dans le catalogue Microsoft Update."
+    fi
+  else
+    echo "Intel VMD : inactif, OK"
+  fi
+  local id name
+  while IFS='|' read -r id name; do
+    [[ -n $id ]] && echo "Réseau : $name ($id) → pilote cherché dans le catalogue Microsoft Update par « stage »"
+  done < <(net_devices)
+  local sb
+  sb=$(od -An -t u1 /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | awk '{print $NF}' || true)
+  echo "Secure Boot : $([[ $sb == 1 ]] && echo activé || echo désactivé)"
+  local t
+  for t in efibootmgr sfdisk partx wipefs mkfs.fat wimlib-imagex cabextract curl python3; do
+    command -v "$t" >/dev/null && echo "$t : OK" || echo "$t : absent (installé automatiquement si besoin)"
+  done
+  [[ -f $STATE ]] && { echo "État existant :"; sed 's/^/  /' "$STATE"; }
+  return 0
+}
+
+cmd_plan() {
+  parse_sizes "$@"
+  detect
+  compute_plan
+  print_plan
+}
+
+cmd_iso() {
+  local lang out_dir=$HOME/Downloads
+  lang=$(iso_lang_default)
+  while (($#)); do
+    case $1 in
+    --lang) lang=${2:?}; shift 2 ;;
+    --out) out_dir=${2:?}; shift 2 ;;
+    *) die "option inconnue : $1" ;;
+    esac
+  done
+  local tmp session edition sku_id uri out
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  session=$(cat /proc/sys/kernel/random/uuid)
+
+  step "Interrogation de Microsoft (Windows 10 22H2, $lang, x64)"
+  curl -fsSL -A "$UA" "$WIN10_PAGE" -o "$tmp/page.html"
+  edition=$(grep -oE '<option value="[0-9]+">Windows 10' "$tmp/page.html" | sed -n 1p | grep -oE '[0-9]+') ||
+    die "édition introuvable sur $WIN10_PAGE"
+  curl -fsS -A "$UA" "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=$session" -o /dev/null
+  curl -fsS -A "$UA" -H "Referer: $WIN10_PAGE" -o "$tmp/sku.json" \
+    "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition?profile=606624d44113&ProductEditionId=$edition&SKU=undefined&friendlyFileName=undefined&Locale=fr-FR&sessionID=$session"
+  sku_id=$(python3 -c 'import json,sys; print(next(s["Id"] for s in json.load(open(sys.argv[1]))["Skus"] if s["Language"] == sys.argv[2]))' "$tmp/sku.json" "$lang") ||
+    die "langue « $lang » introuvable (ex. French, English, English International)"
+  curl -fsS -A "$UA" -H "Referer: $WIN10_PAGE" -o "$tmp/links.json" \
+    "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku?profile=606624d44113&ProductEditionId=undefined&SKU=$sku_id&friendlyFileName=undefined&Locale=fr-FR&sessionID=$session"
+  uri=$(python3 -c 'import json,sys; print(next(o["Uri"] for o in json.load(open(sys.argv[1])).get("ProductDownloadOptions", []) if "x64" in o["Uri"]))' "$tmp/links.json" 2>/dev/null) || {
+    echo
+    echo "Microsoft a refusé le téléchargement automatique (protection anti-robot « Sentinel », liée à l'IP)."
+    echo "Télécharge l'ISO à la main — depuis Linux, la page propose directement l'ISO :"
+    echo "  1. ouvre $WIN10_PAGE"
+    echo "  2. Windows 10 (multi-edition ISO) → Confirmer → Français → 64-bit Download"
+    echo "  3. puis : $(basename "$SELF") stage --iso ~/Downloads/Win10_22H2_French_x64*.iso"
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  out=$out_dir/$(basename "${uri%%\?*}")
+  step "Téléchargement vers $out"
+  curl -fL -C - -A "$UA" -o "$out" "$uri"
+  echo "SHA-256 (à comparer avec celui affiché sur la page Microsoft) :"
+  sha256sum "$out"
+  echo "OK : $out"
+}
+
+cmd_prepare() {
+  as_root prepare "$@"
+  parse_sizes "$@"
+  [[ -f $STATE ]] && die "un état existe déjà ($STATE) : prepare a déjà été lancé"
+  [[ -f $STATE.done ]] && die "Windows a déjà été installé par cet outil ($STATE.done)"
+  detect
+  require_ac
+  compute_plan
+  print_plan
+  echo
+  if [[ $MODE == free ]]; then
+    echo "Cette étape ajoute trois partitions dans l'espace non alloué de /dev/$DISK ; aucune"
+    echo "partition existante n'est modifiée."
+  else
+    cat <<EOF
+Cette étape modifie la table de partitions du disque qui contient Linux.
+Elle est conçue pour être sûre (Btrfs et LUKS sont réduits AVANT la partition,
+avec une marge), mais une coupure de courant pendant l'opération ou un bug
+peut rendre Linux inutilisable. Sans sauvegarde, les données seraient perdues.
+Branche le chargeur.
+EOF
+  fi
+  echo
+  local answer key=""
+  if ((KEY_STDIN)); then
+    IFS= read -r key || [[ -n $key ]] || die "passphrase LUKS attendue sur l'entrée standard"
+  fi
+  if ((!ASSUME_YES)); then
+    read -rp "Tape OUI en majuscules pour continuer : " answer
+    [[ $answer == OUI ]] || die "annulé"
+  fi
+  local t
+  for t in sfdisk partx efibootmgr python3; do ensure_tool "$t"; done
+  [[ $(sfdisk --dump "/dev/$DISK" | awk '/^label:/ {print $2}') == gpt ]] ||
+    die "le disque /dev/$DISK n'est pas en GPT : Windows en UEFI exige une table GPT"
+  if [[ $MODE == shrink ]] && ((LUKS)) && [[ -n $key ]]; then
+    phase 0 5 "Vérification de la passphrase LUKS (avant toute modification)"
+    printf '%s' "$key" | cryptsetup open --test-passphrase --key-file=- "/dev/$PART" ||
+      die "passphrase LUKS incorrecte : rien n'a été modifié"
+  fi
+
+  # LUKS2 peut redemander la passphrase pour redimensionner
+  luks_resize() {
+    if [[ -n $key ]]; then
+      printf '%s' "$key" | cryptsetup resize --key-file=- "$@"
+    else
+      cryptsetup resize "$@"
+    fi
+  }
+
+  mkdir -p "$STATE_DIR"
+  sfdisk --dump "/dev/$DISK" >"$STATE_DIR/ptable-before.sfdisk"
+  echo "Table de partitions sauvegardée : $STATE_DIR/ptable-before.sfdisk"
+
+  if [[ $MODE == shrink ]]; then
+    phase 5 60 "Réduction de Btrfs à $((BTRFS_TARGET / 1048576)) Mio (peut prendre plusieurs minutes)"
+    sync
+    btrfs filesystem resize "$BTRFS_DEVID:$BTRFS_TARGET" /
+    local now
+    now=$(btrfs filesystem usage -b / | awk '/Device size:/ {print $3}')
+    ((now <= BTRFS_TARGET)) || die "Btrfs fait encore $now octets (> $BTRFS_TARGET) : arrêt avant de toucher LUKS"
+
+    if ((LUKS)); then
+      phase 60 70 "Réduction du conteneur LUKS « $DM_NAME » à $NEW_INNER secteurs"
+      luks_resize --size "$NEW_INNER" "$DM_NAME"
+      now=$(blockdev --getsz "/dev/mapper/$DM_NAME")
+      ((now == NEW_INNER)) || die "LUKS fait $now secteurs au lieu de $NEW_INNER : arrêt avant de toucher la partition"
+      ((now * 512 >= BTRFS_TARGET)) || die "incohérence LUKS/Btrfs, arrêt"
+    fi
+
+    phase 70 75 "Réduction de la partition n°$PART_NUM à $NEW_SIZE secteurs"
+    # --wipe*/never : ne jamais toucher aux signatures (en-tête LUKS, superbloc Btrfs)
+    echo "$START, $NEW_SIZE" | sfdisk --no-reread --no-tell-kernel --wipe never --wipe-partitions never -N "$PART_NUM" "/dev/$DISK"
+  fi
+
+  phase 75 80 "Création des partitions MSR, Windows et $STAGE_LABEL"
+  sfdisk --no-reread --no-tell-kernel --wipe never --append "/dev/$DISK" <<EOF
+start=$MSR_START, size=$((MSR_MIB * MIB)), type=$TYPE_MSR, name="Microsoft reserved partition"
+start=$WIN_START, size=$((WIN_MIB * MIB)), type=$TYPE_BASIC, name="Windows"
+start=$STAGE_START, size=$((STAGE_MIB * MIB)), type=$TYPE_BASIC, name="$STAGE_LABEL"
+EOF
+  local num start
+  MSR_NUM="" WIN_NUM="" STAGE_NUM=""
+  # numéros attribués par sfdisk, retrouvés par leur début
+  while read -r num start _; do
+    case $start in
+    "$MSR_START") MSR_NUM=$num ;;
+    "$WIN_START") WIN_NUM=$num ;;
+    "$STAGE_START") STAGE_NUM=$num ;;
+    esac
+  done < <(part_table "$DISK")
+  STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  LINUX_BOOT=$(boot_current)
+  [[ $MSR_NUM =~ ^[0-9]+$ && $WIN_NUM =~ ^[0-9]+$ && $STAGE_NUM =~ ^[0-9]+$ ]] || die "numéros des nouvelles partitions illisibles"
+  save_state
+
+  phase 80 85 "Mise à jour de la table du noyau"
+  local live=1
+  if [[ $MODE == shrink ]]; then
+    partx -u --nr "$PART_NUM" "/dev/$DISK" || live=0
+  fi
+  for num in "$MSR_NUM" "$WIN_NUM" "$STAGE_NUM"; do
+    partx -a --nr "$num" "/dev/$DISK" 2>/dev/null || partx -u --nr "$num" "/dev/$DISK" || live=0
+  done
+  udevadm settle 2>/dev/null || true
+  [[ $MODE == shrink ]] && { (($(<"/sys/class/block/$PART/size") == NEW_SIZE)) || live=0; }
+  partdev "$DISK" "$STAGE_NUM" >/dev/null || live=0
+
+  if ((live)); then
+    if [[ $MODE == shrink ]]; then
+      phase 85 100 "Agrandissement de LUKS et Btrfs dans la marge restante"
+      ((LUKS)) && luks_resize "$DM_NAME"
+      btrfs filesystem resize "$BTRFS_DEVID:max" /
+    fi
+    progress 100
+    echo
+    echo "OK. Étape suivante : $(basename "$SELF") stage --iso <fichier.iso>"
+  else
+    echo
+    echo "Le noyau n'a pas pu relire la table de partitions à chaud (sans danger$([[ $MODE == shrink ]] && echo " :
+Btrfs et LUKS sont déjà plus petits que la nouvelle partition")."
+    echo "Redémarre Linux, puis lance : $(basename "$SELF") stage --iso <fichier.iso>"
+  fi
+}
+
+# --- installation sans intervention ----------------------------------------------
+
+# Clés génériques publiées par Microsoft : elles permettent d'installer l'édition,
+# pas de l'activer (il faut une licence ou une licence numérique liée à la machine).
+generic_key() {
+  case $1 in
+  Core) echo YTMG3-N6DKC-DKB77-7M9GH-8HVX7 ;;
+  Professional) echo VK7JG-NPHTM-C97JM-9MPGT-3V66T ;;
+  Education) echo YNMGQ-8RYV3-4PGQ3-C8XTP-7CFBY ;;
+  esac
+}
+
+edition_id() {
+  case ${1,,} in
+  home | famille | core) echo Core ;;
+  pro | professional | professionnel) echo Professional ;;
+  education | éducation) echo Education ;;
+  *) die "édition inconnue : $1 (Home, Pro ou Education)" ;;
+  esac
+}
+
+# Fuseau Linux → nom de fuseau Windows. Table officielle du CLDR (Unicode) si elle
+# est joignable, sinon une liste courte ; UTC en dernier recours (Windows le
+# corrige ensuite tout seul avec la localisation).
+windows_tz() {
+  local w
+  w=$(python3 - "$1" "$UA" 2>/dev/null <<'PY'
+import re, sys, urllib.request
+tz, ua = sys.argv[1:]
+# le CLDR garde d'anciens noms IANA
+alias = {"Asia/Kolkata": "Asia/Calcutta", "Europe/Kyiv": "Europe/Kiev", "America/Nuuk": "America/Godthab",
+         "Asia/Ho_Chi_Minh": "Asia/Saigon", "Asia/Kathmandu": "Asia/Katmandu", "Asia/Yangon": "Asia/Rangoon",
+         "Atlantic/Faroe": "Atlantic/Faeroe", "Pacific/Kanton": "Pacific/Enderbury"}
+url = "https://raw.githubusercontent.com/unicode-org/cldr/main/common/supplemental/windowsZones.xml"
+t = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": ua}), timeout=30).read().decode()
+for name in (tz, alias.get(tz, "")):
+    for m in re.finditer(r'<mapZone other="([^"]+)" territory="[^"]+" type="([^"]+)"', t):
+        if name and name in m.group(2).split():
+            print(m.group(1))
+            sys.exit(0)
+sys.exit(1)
+PY
+  ) && [[ -n $w ]] && { echo "$w"; return; }
+  case $1 in
+  Africa/Lome | Africa/Abidjan | Africa/Accra | Africa/Dakar | Africa/Bamako | Africa/Ouagadougou | Africa/Conakry | Atlantic/Reykjavik) echo "Greenwich Standard Time" ;;
+  Africa/Lagos | Africa/Douala | Africa/Kinshasa | Africa/Porto-Novo | Africa/Niamey | Africa/Libreville | Africa/Algiers | Africa/Tunis) echo "W. Central Africa Standard Time" ;;
+  Europe/Paris | Europe/Brussels | Europe/Madrid | Europe/Copenhagen) echo "Romance Standard Time" ;;
+  Europe/Berlin | Europe/Zurich | Europe/Rome | Europe/Amsterdam | Europe/Vienna | Europe/Luxembourg | Europe/Stockholm | Europe/Oslo) echo "W. Europe Standard Time" ;;
+  Europe/Warsaw | Europe/Prague | Europe/Budapest | Europe/Belgrade) echo "Central European Standard Time" ;;
+  Europe/Athens | Europe/Bucharest) echo "GTB Standard Time" ;;
+  Europe/Helsinki | Europe/Kiev | Europe/Kyiv) echo "FLE Standard Time" ;;
+  Europe/Moscow) echo "Russian Standard Time" ;;
+  Europe/Istanbul) echo "Turkey Standard Time" ;;
+  Europe/London | Europe/Lisbon | Europe/Dublin) echo "GMT Standard Time" ;;
+  America/Montreal | America/Toronto | America/New_York | America/Detroit) echo "Eastern Standard Time" ;;
+  America/Chicago | America/Winnipeg) echo "Central Standard Time" ;;
+  America/Denver | America/Edmonton) echo "Mountain Standard Time" ;;
+  America/Los_Angeles | America/Vancouver) echo "Pacific Standard Time" ;;
+  America/Sao_Paulo) echo "E. South America Standard Time" ;;
+  America/Mexico_City) echo "Central Standard Time (Mexico)" ;;
+  Africa/Casablanca) echo "Morocco Standard Time" ;;
+  Africa/Cairo) echo "Egypt Standard Time" ;;
+  Africa/Johannesburg) echo "South Africa Standard Time" ;;
+  Asia/Kolkata | Asia/Calcutta) echo "India Standard Time" ;;
+  Asia/Shanghai | Asia/Hong_Kong) echo "China Standard Time" ;;
+  Asia/Tokyo) echo "Tokyo Standard Time" ;;
+  Asia/Seoul) echo "Korea Standard Time" ;;
+  Australia/Sydney | Australia/Melbourne) echo "AUS Eastern Standard Time" ;;
+  *) echo "UTC" ;;
+  esac
+}
+
+# Fuseau horaire de Linux (systemd ou non)
+linux_tz() {
+  local t=""
+  command -v timedatectl >/dev/null && t=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+  [[ -z $t && -r /etc/timezone ]] && t=$(head -1 /etc/timezone)
+  [[ -z $t && -L /etc/localtime ]] && t=$(readlink -f /etc/localtime | sed -n 's|.*/zoneinfo/||p')
+  echo "${t:-UTC}"
+}
+
+# Disposition clavier de Linux (code XKB : fr, us, de…), systemd ou non
+kbd_layout() {
+  local l=""
+  command -v localectl >/dev/null && l=$(localectl status 2>/dev/null | awk '/X11 Layout:/ {print $3}' | cut -d, -f1)
+  [[ -z $l && -r /etc/default/keyboard ]] && l=$(. /etc/default/keyboard 2>/dev/null; echo "${XKBLAYOUT%%,*}")
+  [[ -z $l && -r /etc/X11/xorg.conf.d/00-keyboard.conf ]] &&
+    l=$(awk '/XkbLayout/ {gsub(/"/, "", $3); print $3}' /etc/X11/xorg.conf.d/00-keyboard.conf | cut -d, -f1)
+  [[ -z $l && -r /etc/vconsole.conf ]] && l=$(. /etc/vconsole.conf 2>/dev/null; echo "${KEYMAP:-}")
+  [[ -z $l && -r /etc/conf.d/keymaps ]] && l=$(. /etc/conf.d/keymaps 2>/dev/null; echo "${keymap:-}")
+  l=${l%%-*}   # « fr-latin9 » (console) → fr
+  echo "${l:-us}"
+}
+
+# Disposition clavier Linux → paramètre régional de saisie Windows. Pour les
+# alphabets non latins, l'anglais est ajouté : le mot de passe se tape en latin.
+windows_input() {
+  case $1 in
+  fr | fr-latin*) echo fr-FR ;;
+  be) echo fr-BE ;;
+  ch) echo de-CH ;;
+  ca | cf) echo fr-CA ;;
+  us) echo en-US ;;
+  gb | uk) echo en-GB ;;
+  ie) echo en-IE ;;
+  de) echo de-DE ;;
+  at) echo de-AT ;;
+  es) echo es-ES ;;
+  latam) echo es-MX ;;
+  it) echo it-IT ;;
+  pt) echo pt-PT ;;
+  br) echo pt-BR ;;
+  nl) echo nl-NL ;;
+  dk) echo da-DK ;;
+  se) echo sv-SE ;;
+  no) echo nb-NO ;;
+  fi) echo fi-FI ;;
+  is) echo is-IS ;;
+  pl) echo pl-PL ;;
+  cz) echo cs-CZ ;;
+  sk) echo sk-SK ;;
+  hu) echo hu-HU ;;
+  ro) echo ro-RO ;;
+  si) echo sl-SI ;;
+  hr) echo hr-HR ;;
+  tr) echo tr-TR ;;
+  jp) echo ja-JP ;;
+  kr) echo ko-KR ;;
+  cn) echo zh-CN ;;
+  tw) echo zh-TW ;;
+  ru) echo "ru-RU;en-US" ;;
+  ua) echo "uk-UA;en-US" ;;
+  by) echo "be-BY;en-US" ;;
+  bg) echo "bg-BG;en-US" ;;
+  rs) echo "sr-Latn-RS" ;;
+  gr) echo "el-GR;en-US" ;;
+  il) echo "he-IL;en-US" ;;
+  ara) echo "ar-SA;en-US" ;;
+  ir) echo "fa-IR;en-US" ;;
+  th) echo "th-TH;en-US" ;;
+  in) echo "hi-IN;en-US" ;;
+  vn) echo vi-VN ;;
+  *) echo "$2" ;;
+  esac
+}
+
+# Langue de l'ISO à télécharger, d'après la langue de Linux (nom attendu par Microsoft)
+iso_lang_default() {
+  local l=${LC_ALL:-${LANG:-}}
+  [[ -z $l && -r /etc/locale.conf ]] && l=$(. /etc/locale.conf 2>/dev/null; echo "${LANG:-}")
+  case ${l%%.*} in
+  fr_*) echo French ;;
+  en_US | en_CA) echo English ;;
+  en_*) echo "English International" ;;
+  de_*) echo German ;;
+  es_MX | es_AR | es_CO | es_CL | es_PE | es_US) echo "Spanish (Mexico)" ;;
+  es_*) echo Spanish ;;
+  it_*) echo Italian ;;
+  pt_BR) echo "Brazilian Portuguese" ;;
+  pt_*) echo Portuguese ;;
+  nl_*) echo Dutch ;;
+  pl_*) echo Polish ;;
+  ru_*) echo Russian ;;
+  uk_*) echo Ukrainian ;;
+  tr_*) echo Turkish ;;
+  ja_*) echo Japanese ;;
+  ko_*) echo Korean ;;
+  zh_CN | zh_SG) echo "Chinese Simplified" ;;
+  zh_*) echo "Chinese Traditional" ;;
+  sv_*) echo Swedish ;;
+  da_*) echo Danish ;;
+  nb_* | nn_* | no_*) echo Norwegian ;;
+  fi_*) echo Finnish ;;
+  cs_*) echo Czech ;;
+  sk_*) echo Slovak ;;
+  hu_*) echo Hungarian ;;
+  ro_*) echo Romanian ;;
+  el_*) echo Greek ;;
+  bg_*) echo Bulgarian ;;
+  hr_*) echo Croatian ;;
+  sl_*) echo Slovenian ;;
+  sr_*) echo "Serbian Latin" ;;
+  et_*) echo Estonian ;;
+  lv_*) echo Latvian ;;
+  lt_*) echo Lithuanian ;;
+  ar_*) echo Arabic ;;
+  he_*) echo Hebrew ;;
+  th_*) echo Thai ;;
+  *) echo English ;;
+  esac
+}
+
+# Langue de l'ISO, lue dans sources/lang.ini (« fr-fr = 3 » → fr-FR). Une
+# langue absente de l'image ferait échouer l'installation sans intervention.
+iso_locale() {
+  local lang
+  lang=$(tr -d '\0\r' <"$1/sources/lang.ini" 2>/dev/null |
+    sed -n '/^\[Available UI Languages\]/,/^\[/{s/^\([A-Za-z]\{2\}\)-\([A-Za-z]\{2\}\) *=.*/\1-\2/p}' | sed -n 1p || true)
+  [[ $lang =~ ^[A-Za-z]{2}-[A-Za-z]{2}$ ]] || die "langue de l'ISO illisible (sources/lang.ini)"
+  echo "${lang:0:2}" | tr A-Z a-z | tr -d '\n'
+  echo "-${lang:3:2}" | tr a-z A-Z
+}
+
+# Mot de passe encodé comme le fait Windows SIM (UTF-16LE + suffixe, base64)
+unattend_password() {
+  printf '%s' "$1" | python3 -c 'import base64, sys; print(base64.b64encode((sys.stdin.read() + sys.argv[1]).encode("utf-16-le")).decode())' "$2"
+}
+
+# write_unattend FICHIER DISK_ID : fichier de réponses complet pour ce disque
+write_unattend() {
+  local file=$1 disk_id=$2
+  local arch='processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"'
+  local intl
+  intl="<InputLocale>$U_INPUT</InputLocale>
+      <SystemLocale>$U_LOCALE</SystemLocale>
+      <UILanguage>$U_LOCALE</UILanguage>
+      <UserLocale>$U_LOCALE</UserLocale>"
+  sed 's/$/\r/' >"$file" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Généré par linwin : installation sans intervention sur la partition $WIN_NUM du disque $disk_id. -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">$(((U_DRIVERS)) && echo "
+    <component name=\"Microsoft-Windows-PnpCustomizationsWinPE\" $arch>
+      <DriverPaths><PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"1\"><Path>X:\\linwin\\drivers</Path></PathAndCredentials></DriverPaths>
+    </component>")
+    <component name="Microsoft-Windows-International-Core-WinPE" $arch>
+      <SetupUILanguage><UILanguage>$U_LOCALE</UILanguage></SetupUILanguage>
+      $intl
+    </component>
+    <component name="Microsoft-Windows-Setup" $arch>
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="modify">
+          <DiskID>$disk_id</DiskID>
+          <WillWipeDisk>false</WillWipeDisk>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>$WIN_NUM</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData>
+          </InstallFrom>
+          <InstallTo><DiskID>$disk_id</DiskID><PartitionID>$WIN_NUM</PartitionID></InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        $U_KEY_XML
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+    </component>
+  </settings>
+$(((U_DRIVERS)) && echo "  <settings pass=\"offlineServicing\">
+    <component name=\"Microsoft-Windows-PnpCustomizationsNonWinPE\" $arch>
+      <DriverPaths><PathAndCredentials wcm:action=\"add\" wcm:keyValue=\"1\"><Path>X:\\linwin\\drivers</Path></PathAndCredentials></DriverPaths>
+    </component>
+  </settings>")
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" $arch>
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Horloge matérielle en UTC, comme Linux</Description>
+          <Path>reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Pas de chiffrement automatique du disque</Description>
+          <Path>reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Pas d'écran « confidentialité » pendant l'OOBE</Description>
+          <Path>reg add HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\OOBE /v DisablePrivacyExperience /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Description>Désactive l'hibernation et le démarrage rapide (ils verrouillent les partitions)</Description>
+          <Path>powercfg /h off</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" $arch>
+      <ComputerName>$U_COMPUTER</ComputerName>
+      <TimeZone>$U_TZ</TimeZone>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" $arch>
+      $intl
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" $arch>
+      <TimeZone>$U_TZ</TimeZone>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>$U_USER</Name>
+            <DisplayName>$U_USER</DisplayName>
+            <Group>$U_ADMINS</Group>
+            <Password><Value>$U_PASS_B64</Value><PlainText>false</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>$U_USER</Username>
+        <Password><Value>$U_PASS_B64</Value><PlainText>false</PlainText></Password>
+      </AutoLogon>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Le chargeur de Linux redevient le premier choix au démarrage</Description>
+          <CommandLine>bcdedit /set {fwbootmgr} displayorder {bootmgr} /addlast</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Installe les pilotes réseau depuis $STAGE_LABEL (déjà copiés par l'installeur ; par sécurité)</Description>
+          <CommandLine>cmd /c "for %l in (D E F G H I J K L M N O P Q R S T U V W Y Z) do @if exist %l:\\$TAG if exist %l:\\\$WinPEDriver\$\\net pnputil /add-driver %l:\\\$WinPEDriver\$\\net\\*.inf /subdirs /install"</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Supprime $STAGE_LABEL (repérée par $TAG) et rend son espace à C:</Description>
+          <CommandLine>cmd /c "for %l in (D E F G H I J K L M N O P Q R S T U V W Y Z) do @if exist %l:\\$TAG (echo select volume %l&amp;echo delete partition override&amp;echo select volume C&amp;echo extend) &gt; %WINDIR%\\Temp\\linwin-dp.txt"</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Description>Applique le script diskpart</Description>
+          <CommandLine>cmd /c "if exist %WINDIR%\\Temp\\linwin-dp.txt diskpart /s %WINDIR%\\Temp\\linwin-dp.txt &amp; del /q %WINDIR%\\Temp\\linwin-dp.txt"</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Description>Efface les copies du fichier de réponses (mot de passe en base64)</Description>
+          <CommandLine>cmd /c "del /q /f %WINDIR%\\Panther\\unattend*.xml %WINDIR%\\Panther\\Unattend\\unattend*.xml 2&gt;nul"</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <Description>Retour sous Linux pour finaliser</Description>
+          <CommandLine>shutdown /r /t 20 /c "Windows est installé. Retour sous Linux pour finaliser."</CommandLine>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
+EOF
+}
+
+# Script lancé par WinPE à la place de l'installeur (seuls cmd.exe, diskpart,
+# drvload et ping y sont disponibles, PAS findstr) : charge le pilote VMD éventuel,
+# trouve le disque dont la partition Windows commence EXACTEMENT au bon octet, puis
+# lance l'installation automatique sur ce disque. Sinon : installation manuelle.
+write_start_cmd() {
+  local file=$1 offset=$2
+  sed 's/$/\r/' >"$file" <<EOF
+@echo off
+title linwin
+set W=X:\\linwin
+rem journal sur WINSETUP (lisible ensuite depuis Linux), sinon en RAM
+set LOG=%W%\\linwin.log
+for %%l in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if exist %%l:\\$TAG set LOG=%%l:\\linwin.log
+echo === linwin start.cmd > %LOG%
+if exist %W%\\drivers\\ for /r %W%\\drivers %%f in (*.inf) do drvload "%%f" >> %LOG% 2>&1
+set DISK=
+rem le SSD derriere VMD peut mettre quelques secondes a apparaitre apres drvload
+for %%t in (1 2 3 4 5) do if not defined DISK call :scan
+if not defined DISK goto manual
+echo Partition Windows trouvee sur le disque %DISK% : installation automatique.
+echo disque %DISK% : setup /unattend >> %LOG%
+X:\\sources\\setup.exe /unattend:%W%\\unattend-%DISK%.xml
+goto :eof
+:manual
+echo Partition Windows introuvable : installation manuelle, par securite.
+echo partition introuvable (decalage $offset) : setup manuel >> %LOG%
+X:\\sources\\setup.exe
+goto :eof
+:scan
+for %%d in (0 1 2 3 4 5 6 7) do call :probe %%d
+if not defined DISK ping -n 3 127.0.0.1 >nul
+goto :eof
+:probe
+if defined DISK goto :eof
+(echo select disk %1& echo select partition $WIN_NUM& echo detail partition) > %W%\\dp.txt
+diskpart /s %W%\\dp.txt > %W%\\dp.out 2>&1
+type %W%\\dp.out >> %LOG%
+rem pas de findstr dans ce WinPE : for /f est integre a cmd.exe
+rem ligne "Offset in Bytes: N" : 2e champ apres ":", espaces retires
+for /f "usebackq tokens=2 delims=:" %%v in ("%W%\\dp.out") do for /f "tokens=1" %%n in ("%%v") do if "%%n"=="$offset" set DISK=%1
+goto :eof
+EOF
+}
+
+cmd_stage() {
+  as_root stage "$@"
+  local iso="" driver="" edition="" user="" pass_stdin=0 password="" no_net=0 t
+  while (($#)); do
+    case $1 in
+    --iso) iso=$(readlink -f "${2:?}"); shift 2 ;;
+    --vmd-driver) driver=$(readlink -f "${2:?}"); shift 2 ;;
+    --no-net-drivers | --no-wifi) no_net=1; shift ;;
+    --edition) edition=$(edition_id "${2:?}"); shift 2 ;;
+    --user) user=${2:?}; shift 2 ;;
+    --password-stdin) pass_stdin=1; shift ;;
+    *) die "option inconnue : $1" ;;
+    esac
+  done
+  [[ -f $iso ]] || die "précise l'ISO : --iso <fichier.iso>"
+  local unattended=0
+  if [[ -n $user || -n $edition ]]; then
+    [[ -n $user && -n $edition ]] || die "le mode sans intervention demande --user et --edition"
+    [[ $user =~ ^[A-Za-z][A-Za-z0-9_-]{0,19}$ ]] || die "nom d'utilisateur invalide (lettres, chiffres, - et _, 20 max)"
+    [[ ${user,,} =~ ^(administrator|administrateur|guest|invité|defaultaccount)$ ]] && die "« $user » est réservé par Windows"
+    if ((pass_stdin)); then
+      IFS= read -r password || true
+    fi
+    unattended=1
+  fi
+  load_state
+  for t in python3 curl cabextract efibootmgr; do ensure_tool "$t"; done
+  if [[ -n $driver ]]; then
+    [[ -n $(find "$driver" -iname '*.inf' -print -quit) ]] || die "aucun .inf dans $driver"
+    vmd_active && ! driver_supports "$driver" &&
+      warn "ce pilote ne déclare pas le contrôleur VMD $(vmd_ids | paste -sd ' ') — l'installeur risque de ne pas voir le SSD"
+  elif vmd_active && rst_covers; then
+    # sans ce pilote, l'installeur Windows 10 ne voit pas le SSD derrière VMD
+    phase 0 3 "Pilote Intel RST VMD (iaStorVD 20.2.6.1025)"
+    fetch_rst_driver
+    driver_supports "$RST_CACHE" ||
+      die "le pilote Intel RST 20.2.6.1025 ne gère pas ce contrôleur VMD ($(vmd_ids | paste -sd ' ')) : fournis le bon pilote F6 avec --vmd-driver"
+    driver=$RST_CACHE
+  elif vmd_active; then
+    # autre contrôleur VMD (ex. 11e génération, 9A0B) : pilote du catalogue Microsoft
+    phase 0 3 "Pilote du contrôleur VMD $(vmd_ids | paste -sd ' ') (catalogue Microsoft Update)"
+    local vd hw
+    driver=$DRV_CACHE/vmd
+    rm -rf "$driver"
+    mkdir -p "$driver"
+    for vd in /sys/bus/pci/drivers/vmd/[0-9a-f]*:*; do
+      hw=$(pci_hwid "$vd")
+      catalog_fetch "$hw" "$(sed 's/^0x//' <"$vd/class" | tr a-f A-F)" ||
+        die "aucun pilote pour le contrôleur VMD ($hw) : sans lui l'installeur ne verra pas le SSD. Fournis un pilote F6 avec --vmd-driver, ou désactive VMD dans le BIOS"
+      cp -r "$(drv_dir "$hw")" "$driver/"
+    done
+    driver_supports "$driver" || die "le pilote trouvé ne déclare pas le contrôleur VMD : fournis-en un avec --vmd-driver"
+  fi
+  # Pilotes réseau : utiles (Windows Update) mais pas indispensables
+  local net_dirs=()
+  if ((!no_net)) && [[ -n $(net_devices) ]]; then
+    phase 3 4 "Pilotes réseau (catalogue Microsoft Update)"
+    mapfile -t net_dirs < <(fetch_net_drivers)
+  fi
+  local dev
+  dev=$(partdev "$DISK" "$STAGE_NUM") || die "partition n°$STAGE_NUM introuvable : redémarre si « prepare » l'a demandé"
+  require_ac
+
+  # Si « prepare » a dû demander un redémarrage, Btrfs n'a pas récupéré sa marge
+  detect
+  if [[ $MODE == shrink ]] && ((SHRINK_OK)); then
+    btrfs filesystem resize "$BTRFS_DEVID:max" / >/dev/null
+  fi
+
+  phase 3 4 "Outils nécessaires"
+  for t in wimlib-imagex mkfs.fat; do ensure_tool "$t"; done
+
+  STAGED=0
+  save_state
+  release_stage_dev "$dev"
+  phase 4 5 "Formatage de $dev en FAT32 ($STAGE_LABEL)"
+  mkfs.fat -F 32 -n "$STAGE_LABEL" "$dev"
+  udevadm settle || true
+
+  local work
+  work=$(mktemp -d)
+  mkdir "$work/iso" "$work/dst"
+  trap 'umount -q "'"$work"'/iso" "'"$work"'/dst" 2>/dev/null; rm -rf "'"$work"'/pe"; rmdir "'"$work"'/iso" "'"$work"'/dst" "'"$work"'" 2>/dev/null' EXIT
+  mount -o loop,ro "$iso" "$work/iso"
+  mount "$dev" "$work/dst"
+  [[ -f $work/iso/efi/boot/bootx64.efi ]] || die "cette ISO n'a pas de chargeur UEFI x64 (efi/boot/bootx64.efi)"
+  [[ -f $work/iso/sources/boot.wim ]] || die "cette ISO ne ressemble pas à un installeur Windows (sources/boot.wim absent)"
+
+  local src_image=""
+  for src_image in "$work/iso/sources/install.wim" "$work/iso/sources/install.esd" ""; do
+    [[ -z $src_image || -f $src_image ]] && break
+  done
+  [[ -n $src_image ]] || die "cette ISO ne contient ni install.wim ni install.esd"
+
+  local index=""
+  if ((unattended)); then
+    index=$(wimlib-imagex info "$src_image" | awk -v want="$edition" '
+      /^Index:/ { i = $2 }
+      /^Edition ID:/ && $3 == want && !found { print i; found = 1 }')
+    [[ -n $index ]] || die "l'édition $edition n'est pas dans cette ISO"
+  fi
+
+  # l'extraction d'une édition (≈ 20 min) pèse bien plus que la copie (≈ 1 Go)
+  local copy_end=$( ((unattended)) && echo 10 || echo 25)
+  phase 5 "$copy_end" "Copie de l'installeur"
+  copy_installer() {
+    tar -C "$work/iso" --exclude=./sources/install.wim --exclude=./sources/install.esd -cf - . |
+      tar -C "$work/dst" -xf - --no-same-owner --no-same-permissions
+  }
+  progress_size "$(du -sb --exclude=install.wim --exclude=install.esd "$work/iso" | cut -f1)" "$work/dst" copy_installer
+  : >"$work/dst/$TAG"
+  if ((unattended)); then
+    phase "$copy_end" 95 "Extraction de l'édition $edition (image n°$index) en install.esd — environ 20 minutes"
+    wimlib-imagex export "$src_image" "$index" "$work/dst/sources/install.esd" --solid 2>&1 | progress_filter
+  elif (($(stat -c %s "$src_image") >= 4294967295)); then
+    phase "$copy_end" 95 "Découpage de l'image (> 4 Gio, limite FAT32)"
+    wimlib-imagex split "$src_image" "$work/dst/sources/install.swm" 3800 2>&1 | progress_filter
+  else
+    phase "$copy_end" 95 "Copie de l'image Windows"
+    progress_size "$(stat -c %s "$src_image")" "$work/dst" cp "$src_image" "$work/dst/sources/"
+  fi
+
+  local pe=$work/pe
+  mkdir -p "$pe/linwin"
+  if [[ -n $driver ]]; then
+    phase 95 96 "Ajout du pilote Intel RST VMD ($driver)"
+    mkdir -p "$work/dst/\$WinPEDriver\$/vmd" "$pe/linwin/drivers"
+    cp -r "$driver"/. "$work/dst/\$WinPEDriver\$/vmd/"
+    cp -r "$driver"/. "$pe/linwin/drivers/"
+  fi
+  if ((${#net_dirs[@]})); then
+    # Hors de boot.wim (inutiles en WinPE, ils occuperaient la RAM) : l'installeur
+    # lit $WinPEDriver$ sur tous les volumes et copie ces pilotes dans Windows.
+    phase 96 96 "Ajout des pilotes réseau"
+    local n=0 nd
+    for nd in "${net_dirs[@]}"; do
+      n=$((n + 1))
+      mkdir -p "$work/dst/\$WinPEDriver\$/net/$n"
+      cp -r "$nd"/. "$work/dst/\$WinPEDriver\$/net/$n/"
+      echo "  $(sed -n 1p "$nd/linwin-source.txt")"
+    done
+  fi
+
+  if ((unattended)); then
+    phase 96 97 "Préparation de l'installation sans intervention"
+    local layout tz host win_dev
+    layout=$(kbd_layout)
+    tz=$(linux_tz)
+    host=$(tr -cd 'A-Za-z0-9-' </proc/sys/kernel/hostname | tr '[:lower:]' '[:upper:]')
+    U_LOCALE=$(iso_locale "$work/iso")
+    U_INPUT=$(windows_input "$layout" "$U_LOCALE")
+    U_TZ=$(windows_tz "$tz")
+    U_COMPUTER=$(printf 'WIN-%s' "$host" | cut -c1-15)
+    U_USER=$user
+    U_ADMINS=$([[ $U_LOCALE == fr-* ]] && echo Administrateurs || echo Administrators)
+    if oem_license && [[ $edition == Core ]]; then
+      # Sans clé, l'installeur prend celle du firmware : Windows s'active tout seul
+      U_KEY_XML="<!-- clé lue dans le firmware (licence OEM) -->"
+      echo "Licence Windows trouvée dans le firmware : elle sera utilisée (activation automatique)."
+    else
+      U_KEY_XML="<ProductKey><Key>$(generic_key "$edition")</Key><WillShowUI>OnError</WillShowUI></ProductKey>"
+      oem_license && warn "la licence du firmware est en général une édition Famille : avec $edition, Windows ne sera pas activé"
+    fi
+    U_PASS_B64=$(unattend_password "$password" Password)
+    U_DRIVERS=$([[ -n $driver ]] && echo 1 || echo 0)
+    win_dev=$(partdev "$DISK" "$WIN_NUM") || die "partition Windows n°$WIN_NUM introuvable"
+    local d
+    for d in 0 1 2 3 4 5 6 7; do
+      write_unattend "$pe/linwin/unattend-$d.xml" "$d"
+    done
+    write_start_cmd "$pe/linwin/start.cmd" $(($(<"/sys/class/block/${win_dev##*/}/start") * 512))
+    echo "Langue $U_LOCALE, clavier $U_INPUT, fuseau « $U_TZ », compte local « $U_USER », PC « $U_COMPUTER »"
+  fi
+
+  if [[ -n $driver ]] || ((unattended)); then
+    if ((!unattended)); then
+      # pilote seul : charger les .inf puis lancer l'installeur normal
+      {
+        echo '@echo off'
+        echo 'for /r X:\linwin\drivers %%f in (*.inf) do drvload "%%f"'
+        echo 'X:\sources\setup.exe'
+      } | sed 's/$/\r/' >"$pe/linwin/start.cmd"
+    fi
+    printf '[LaunchApps]\r\n%%SYSTEMROOT%%\\System32\\cmd.exe, /c X:\\linwin\\start.cmd\r\n' >"$pe/winpeshl.ini"
+    phase 97 99 "Injection dans l'environnement de l'installeur (boot.wim)"
+    wimlib-imagex update "$work/dst/sources/boot.wim" 2 2>&1 <<EOF | progress_filter
+add '$pe/linwin' '/linwin'
+add '$pe/winpeshl.ini' '/Windows/System32/winpeshl.ini'
+EOF
+  fi
+  rm -rf "$pe"
+
+  phase 99 100 "Synchronisation (écriture sur le disque)"
+  sync
+  progress 100
+  STAGED=1 UNATTENDED=$unattended VMD_DRIVER=$([[ -n $driver ]] && echo 1 || echo 0) NET_DRIVERS=${#net_dirs[@]}
+  save_state
+  echo "OK. Étape suivante : $(basename "$SELF") boot"
+}
+
+cmd_boot() {
+  as_root boot "$@"
+  load_state
+  local dev
+  dev=$(partdev "$DISK" "$STAGE_NUM") || die "partition $STAGE_LABEL introuvable"
+  [[ $(blkid -s LABEL -o value "$dev") == "$STAGE_LABEL" ]] || die "$dev n'est pas préparée : lance « stage » d'abord"
+  vmd_active && ! ((VMD_DRIVER)) && warn "Intel VMD est actif et aucun pilote n'a été ajouté : relance « stage »."
+  # finish retirera toute entrée UEFI pointant vers WINSETUP, y compris celles que
+  # le firmware crée tout seul (« UEFI OS »), même si Windows a supprimé la partition
+  STAGE_PARTUUID=$(blkid -s PARTUUID -o value "$dev" 2>/dev/null || true)
+  save_state
+
+  local order num old
+  order=$(efibootmgr | awk -F': ' '/^BootOrder/ {print $2}')
+  for old in $(efibootmgr | grep -F "$EFI_LABEL" | sed -E 's/^Boot([0-9A-Fa-f]{4}).*/\1/'); do
+    efibootmgr -q -b "$old" -B
+    order=$(sed -E "s/(^|,)$old(,|$)/\1\2/; s/,,/,/; s/^,|,$//g" <<<"$order")
+  done
+  efibootmgr -q --create --disk "/dev/$DISK" --part "$STAGE_NUM" --label "$EFI_LABEL" --loader '\EFI\BOOT\BOOTX64.EFI'
+  num=$(efibootmgr | grep -F "$EFI_LABEL" | sed -n 1p | sed -E 's/^Boot([0-9A-Fa-f]{4}).*/\1/')
+  [[ -n $num ]] || die "entrée UEFI non créée"
+  efibootmgr -q --bootorder "$order"
+  efibootmgr -q --bootnext "$num"
+
+  if ((UNATTENDED)); then
+    install_auto_finish
+    cat <<EOF
+Prêt. Au prochain redémarrage, Windows s'installe tout seul (20 à 40 minutes, plusieurs redémarrages) :
+  installeur → partition n°$WIN_NUM uniquement → compte local → première session automatique
+  → retour automatique sous Linux, qui finalise au démarrage (Windows ajouté au menu de $(loader_label "$(boot_loader_kind)")).
+Ne touche à rien pendant ce temps. Laisse le chargeur branché.
+EOF
+    return
+  fi
+
+  local size_gb
+  size_gb=$(($(<"/sys/class/block/$(basename "$(partdev "$DISK" "$WIN_NUM")")/size") / 2097152))
+  cat <<EOF
+Prêt. Au prochain redémarrage (une seule fois), la machine démarre l'installeur Windows.
+Linux reste le choix par défaut ensuite.
+
+Dans l'installeur :
+  1. « Je n'ai pas de clé de produit » si tu n'en as pas, puis choisis l'édition.
+  2. Type d'installation : « Personnalisée ».
+  3. Sélectionne UNIQUEMENT « Lecteur 0 Partition $WIN_NUM » (~$size_gb Go, « Espace non alloué » ou non formatée),
+     clique « Formater » si demandé, puis « Suivant ».
+     Ne supprime ni ne formate AUCUNE autre partition$( ((PART_NUM)) && echo " : la n°$PART_NUM est Linux").
+$( ((VMD_DRIVER)) && echo "     Si aucun disque n'apparaît : « Charger un pilote » → Parcourir → $STAGE_LABEL\\\$WinPEDriver\$\\vmd.")
+
+Une fois Windows installé et démarré, reviens sous Linux (menu de démarrage UEFI : F8, F11 ou F12 selon le PC)
+et lance : $(basename "$SELF") finish
+EOF
+}
+
+# Reprend une installation faite sous l'ancien nom : état (nécessaire à
+# « cancel »), copie root, liens, règle udev et service de finalisation
+migrate_legacy() {
+  local old_unit=/etc/systemd/system/$LEGACY-finish.service
+  if [[ -d /var/lib/$LEGACY && ! -e $STATE_DIR ]]; then
+    mv "/var/lib/$LEGACY" "$STATE_DIR"
+    echo "État repris : /var/lib/$LEGACY → $STATE_DIR"
+  fi
+  rm -f "/usr/local/bin/$LEGACY" "/usr/local/bin/$LEGACY-gui" "/run/udev/rules.d/90-$LEGACY.rules"
+  rm -rf "/usr/local/lib/$LEGACY"
+  if [[ -f $old_unit ]]; then
+    systemctl disable "$LEGACY-finish.service" 2>/dev/null || true
+    rm -f "$old_unit"
+    systemctl daemon-reload
+    MIGRATE_UNIT=1
+  fi
+}
+
+# Copie l'outil (et son interface) en root:root dans $INSTALL_DIR
+install_files() {
+  local src_dir
+  src_dir=$(dirname "$SELF")
+  migrate_legacy
+  [[ $SELF == "$INSTALLED_BIN" ]] && return 0
+  install -D -o root -g root -m 0755 "$SELF" "$INSTALLED_BIN"
+  if [[ -f $src_dir/linwin-gui ]]; then
+    install -o root -g root -m 0755 "$src_dir/linwin-gui" "$INSTALL_DIR/linwin-gui"
+    ln -sfn "$INSTALL_DIR/linwin-gui" /usr/local/bin/linwin-gui
+    # lanceur pour tous les utilisateurs, quelle que soit la distribution
+    install -d /usr/local/share/applications
+    cat >/usr/local/share/applications/linwin.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=linwin
+GenericName=Windows en dual-boot
+Comment=Installer Windows 10 à côté de Linux, sans clé USB
+Exec=/usr/local/bin/linwin-gui
+Icon=drive-multidisk
+Terminal=false
+Categories=System;
+StartupWMClass=io.github._2Deathadder.linwin
+EOF
+  fi
+  ln -sfn "$INSTALLED_BIN" /usr/local/bin/linwin
+}
+
+cmd_install() {
+  as_root install "$@"
+  install_files
+  installed_trusted || die "la copie installée n'est pas sûre (droits de $INSTALL_DIR ?)"
+  if ((${MIGRATE_UNIT:-0})); then
+    install_auto_finish
+    echo "Service de finalisation recréé sous le nouveau nom."
+  fi
+  echo "Installé : $INSTALLED_BIN (root:root). L'interface lance désormais cette copie en root."
+  echo "Après toute modification du script de $(dirname "$SELF"), relance « install »."
+}
+
+# Finalisation automatique : lancée à chaque démarrage de Linux tant que
+# l'installation est en cours ; dès que Windows est installé, elle exécute
+# « finish » puis se retire. Elle exécute la copie root:root : le script de
+# l'utilisateur est modifiable par lui et ne doit jamais être lancé tel quel par
+# root au démarrage. systemd ou OpenRC ; ailleurs, « finish » se lance à la main.
+install_auto_finish() {
+  install_files
+  installed_trusted || die "la copie installée n'est pas sûre : finalisation automatique non créée"
+  case $(init_kind) in
+  systemd)
+    cat >"$AUTO_UNIT" <<EOF
+[Unit]
+Description=linwin : finalisation après l'installation de Windows
+ConditionPathExists=$STATE
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALLED_BIN finish --auto
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable linwin-finish.service
+    ;;
+  openrc)
+    mkdir -p "$(dirname "$AUTO_OPENRC")"
+    printf '#!/bin/sh\n# linwin : finalisation après l'"'"'installation de Windows\n[ -f %s ] && %s finish --auto\n' \
+      "$STATE" "$INSTALLED_BIN" >"$AUTO_OPENRC"
+    chmod 755 "$AUTO_OPENRC"
+    rc-update add local default >/dev/null 2>&1 || warn "service OpenRC « local » non activé : lance « finish » à la main après l'installation"
+    ;;
+  *)
+    warn "système d'init non géré : après l'installation de Windows, reviens sous Linux et lance « $(basename "$SELF") finish »"
+    ;;
+  esac
+}
+
+auto_finish_installed() { [[ -f $AUTO_UNIT || -f $AUTO_OPENRC ]]; }
+
+remove_auto_finish() {
+  if [[ -f $AUTO_UNIT ]]; then
+    systemctl disable linwin-finish.service 2>/dev/null || true
+    rm -f "$AUTO_UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  rm -f "$AUTO_OPENRC"
+}
+
+# Retire l'entrée UEFI de l'installeur, plus celles que le firmware a pu créer
+# tout seul sur WINSETUP (« UEFI OS »), repérées par son PARTUUID
+remove_stage_entries() {
+  local old uuid=""
+  # un PARTUUID complet seulement : une valeur vide ou « 0 » désignerait toutes les entrées
+  [[ ${STAGE_PARTUUID:-} =~ ^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$ ]] && uuid=$STAGE_PARTUUID
+  for old in $(efibootmgr | grep -F -e "$EFI_LABEL" -e "$LEGACY_EFI_LABEL" ${uuid:+-i -e "$uuid"} \
+      | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p' || true); do
+    efibootmgr -q -b "$old" -B
+  done
+}
+
+# Windows est installé quand sa partition est en NTFS et que son gestionnaire de
+# démarrage est déclaré au firmware (une entrée seule pourrait dater d'avant).
+windows_installed() {
+  local dev
+  grep -q "Windows Boot Manager" <<<"$(efibootmgr 2>/dev/null)" || return 1
+  dev=$(partdev "$DISK" "$WIN_NUM") || return 1
+  # blkid -p lit le disque (root) ; sinon, cache udev via lsblk
+  [[ $(blkid -p -s TYPE -o value "$dev" 2>/dev/null || lsblk -dno FSTYPE "$dev" 2>/dev/null) == ntfs ]]
+}
+
+# --- chargeurs de démarrage ---------------------------------------------------------
+
+# Le chargeur de Linux repasse en tête de l'ordre de démarrage UEFI : celui
+# enregistré par « prepare », sinon celui qui vient de démarrer Linux.
+linux_boot_first() {
+  local first=${LINUX_BOOT:-} order
+  [[ -n $first ]] && efibootmgr | grep -qi "^Boot$first" || first=$(boot_current)
+  if [[ -z $first ]] || efibootmgr | grep -i "^Boot$first" | grep -qi "Windows Boot Manager"; then
+    warn "entrée UEFI de Linux introuvable : vérifie l'ordre de démarrage dans le BIOS"
+    return 0
+  fi
+  order=$(efibootmgr | awk -F': ' '/^BootOrder/ {print $2}')
+  order=$(sed -E "s/(^|,)$first(,|$)/\1\2/; s/,,/,/; s/^,|,$//g" <<<"$order")
+  efibootmgr -q --bootorder "$first${order:+,$order}"
+}
+
+# Fichier de configuration de Limine (plusieurs emplacements possibles)
+limine_conf() {
+  local esp=$ESP_DIR c
+  [[ -r /etc/default/limine ]] && esp=$(. /etc/default/limine; echo "${ESP_PATH:-$ESP_DIR}")
+  for c in "$esp/limine.conf" "$esp/limine/limine.conf" "$esp/EFI/limine/limine.conf" "$esp/EFI/BOOT/limine.conf" /boot/limine/limine.conf /boot/limine.conf; do
+    [[ -f $c ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+grub_regen() {
+  if command -v update-grub >/dev/null; then
+    update-grub
+  elif command -v grub2-mkconfig >/dev/null && [[ -f /boot/grub2/grub.cfg ]]; then
+    grub2-mkconfig -o /boot/grub2/grub.cfg
+  elif command -v grub-mkconfig >/dev/null && [[ -f /boot/grub/grub.cfg ]]; then
+    grub-mkconfig -o /boot/grub/grub.cfg
+  else
+    return 1
+  fi
+}
+
+# Ajoute Windows au menu du chargeur qui démarre Linux
+loader_add_windows() {
+  local kind=$1 efi=$ESP_DIR/EFI/Microsoft/Boot/bootmgfw.efi conf uuid
+  [[ -f $efi ]] || { warn "$efi introuvable : démarre Windows via le menu de démarrage UEFI (F8, F11 ou F12 selon le PC)"; return 0; }
+  case $kind in
+  limine)
+    conf=$(limine_conf) || { warn "limine.conf introuvable : ajoute Windows à Limine à la main"; return 0; }
+    command -v limine-update >/dev/null && { limine-update || warn "limine-update a échoué"; }
+    if ! grep -qi bootmgfw "$conf"; then
+      if command -v limine-entry-tool >/dev/null; then
+        limine-entry-tool --add-efi "Windows" "$efi" --comment "Windows 10" --priority 30 || warn "ajout de Windows à Limine échoué"
+      else
+        # chemin relatif à la partition d'où Limine a démarré (l'ESP)
+        printf '\n# >>> linwin\n/Windows\n    protocol: efi\n    path: boot():/EFI/Microsoft/Boot/bootmgfw.efi\n# <<< linwin\n' >>"$conf"
+      fi
+    fi
+    grep -qi bootmgfw "$conf" || warn "Windows absent de $conf : démarre-le via le menu de démarrage UEFI"
+    ;;
+  grub)
+    uuid=$(blkid -s UUID -o value "$ESP_DEV")
+    cat >"$GRUB_SCRIPT" <<EOF
+#!/bin/sh
+# Ajouté par linwin (retiré par « linwin cancel ») : démarre Windows depuis la partition EFI
+cat <<'GRUB'
+menuentry 'Windows' --class windows --class os {
+	insmod part_gpt
+	insmod fat
+	insmod chain
+	search --no-floppy --fs-uuid --set=root $uuid
+	chainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}
+GRUB
+EOF
+    chmod 755 "$GRUB_SCRIPT"
+    # Ubuntu et Fedora masquent le menu quand un seul système est connu
+    if [[ -f /etc/default/grub ]]; then
+      [[ -f $STATE_DIR/grub.default.bak ]] || cp /etc/default/grub "$STATE_DIR/grub.default.bak"
+      sed -i -E 's/^GRUB_TIMEOUT_STYLE=.*hidden.*/GRUB_TIMEOUT_STYLE=menu/; s/^GRUB_TIMEOUT=["'\'']?0["'\'']?$/GRUB_TIMEOUT=5/' /etc/default/grub
+    fi
+    command -v grub2-editenv >/dev/null && grub2-editenv - unset menu_auto_hide 2>/dev/null || true
+    grub_regen || warn "configuration de GRUB non régénérée : lance update-grub (ou grub-mkconfig -o …/grub.cfg)"
+    ;;
+  systemd-boot)
+    # systemd-boot affiche tout seul le Windows de la même partition EFI ; encore
+    # faut-il que le menu apparaisse (timeout 0 = menu caché)
+    conf=$ESP_DIR/loader/loader.conf
+    if [[ -f $conf ]] && ! grep -Eq '^timeout +([1-9]|menu-force)' "$conf"; then
+      sed -i -E '/^timeout\b/d' "$conf"
+      echo "timeout 5" >>"$conf"
+    fi
+    ;;
+  refind)
+    : # rEFInd détecte Windows tout seul
+    ;;
+  *)
+    warn "chargeur de Linux non reconnu : démarre Windows via le menu de démarrage UEFI (F8, F11 ou F12 selon le PC)"
+    ;;
+  esac
+}
+
+# Retire Windows du menu du chargeur (annulation)
+loader_remove_windows() {
+  local conf
+  if conf=$(limine_conf 2>/dev/null) && grep -qi bootmgfw "$conf"; then
+    if grep -q '^# >>> linwin' "$conf"; then
+      sed -i '/^# >>> linwin$/,/^# <<< linwin$/d' "$conf"
+    elif command -v limine-entry-tool >/dev/null; then
+      limine-entry-tool --remove-efi-path "$ESP_DIR/EFI/Microsoft/Boot/bootmgfw.efi" --keep-files ||
+        warn "retrait de Windows du menu Limine échoué"
+    fi
+  fi
+  if [[ -f $GRUB_SCRIPT ]]; then
+    rm -f "$GRUB_SCRIPT"
+    grub_regen || warn "configuration de GRUB non régénérée : lance update-grub"
+  fi
+}
+
+cmd_finish() {
+  as_root finish "$@"
+  local auto=0
+  [[ ${1:-} == --auto ]] && auto=1
+  load_state
+  if ! windows_installed; then
+    ((auto)) && { echo "Windows n'est pas encore installé : rien à faire."; exit 0; }
+    die "Windows n'est pas installé (partition n°$WIN_NUM non NTFS ou pas de « Windows Boot Manager »)"
+  fi
+  find_esp || die "partition EFI introuvable (non montée ?)"
+  local kind
+  kind=$(boot_loader_kind)
+
+  phase 0 20 "Retrait des entrées UEFI de l'installeur"
+  local dev
+  if [[ ${STAGE_PARTUUID:-0} == 0 ]] && dev=$(partdev "$DISK" "$STAGE_NUM"); then
+    STAGE_PARTUUID=$(blkid -s PARTUUID -o value "$dev" 2>/dev/null || true)
+  fi
+  remove_stage_entries
+
+  phase 20 40 "Le chargeur de Linux redevient le premier choix au démarrage"
+  linux_boot_first
+
+  phase 40 60 "Suppression de la partition $STAGE_LABEL"
+  # normalement Windows l'a déjà supprimée et a étendu C: (FirstLogonCommands)
+  local leftover=0
+  if dev=$(partdev "$DISK" "$STAGE_NUM"); then
+    leftover=1
+    release_stage_dev "$dev"
+    [[ $(blkid -s LABEL -o value "$dev" 2>/dev/null) == "$STAGE_LABEL" ]] || die "$dev n'est plus $STAGE_LABEL : arrêt par prudence"
+    sfdisk --no-reread --no-tell-kernel --delete "/dev/$DISK" "$STAGE_NUM"
+    partx -d --nr "$STAGE_NUM" "/dev/$DISK" || true
+  fi
+
+  phase 60 100 "Ajout de Windows au menu de $(loader_label "$kind")"
+  loader_add_windows "$kind"
+  progress 100
+  mv "$STATE" "$STATE.done"
+  rm -rf "$RST_CACHE" "$DRV_CACHE"
+  rm -f /run/udev/rules.d/90-linwin.rules
+  local unattended=$UNATTENDED
+  # en dernier : en mode --auto, c'est le service lui-même qui se retire
+  remove_auto_finish
+
+  echo
+  echo "Terminé. Windows se choisit dans $(loader_label "$kind")$([[ $kind == inconnu ]] || echo " (ou le menu de démarrage UEFI)")."
+  if ((unattended)); then
+    echo "Pense à activer Windows avec ta licence si elle n'est pas dans le firmware."
+    ((leftover)) && echo "Pour récupérer l'espace de $STAGE_LABEL : Gestion des disques → C: → Étendre le volume."
+    return 0
+  fi
+  cat <<EOF
+
+Conseillé, côté Windows (invite de commandes administrateur) :
+  - désactiver le démarrage rapide, qui verrouille les partitions :  powercfg /h off
+  - garder l'heure juste entre les deux systèmes :
+      reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f
+$( ((leftover)) && echo "  - récupérer l'espace de $STAGE_LABEL : Gestion des disques → C: → Étendre le volume")
+EOF
+}
+
+# Table du disque telle qu'écrite sur le disque (pas celle du noyau) :
+# une ligne « numéro début taille TYPE nom » par partition
+part_table() {
+  sfdisk --json "/dev/$1" | python3 -c '
+import json, re, sys
+for p in json.load(sys.stdin)["partitiontable"].get("partitions", []):
+    print(re.search(r"(\d+)$", p["node"]).group(1), p["start"], p["size"], p["type"].upper(), p.get("name", "").replace(" ", "_") or "-")'
+}
+
+# Copie les pilotes réseau sur la partition d'un Windows déjà installé (par
+# exemple installé sans eux) : C:\linwin\installer-pilotes.cmd les installe.
+cmd_drivers() {
+  as_root drivers "$@"
+  (($# == 0)) || die "option inconnue : $1"
+  local src=$STATE
+  [[ -f $src ]] || src=$STATE.done
+  [[ -f $src ]] || die "aucune installation de Windows connue ($STATE introuvable)"
+  # shellcheck disable=SC1090
+  source "$src"
+  [[ -n $(net_devices) ]] || die "aucune carte réseau PCI dans ce PC"
+  local dev
+  dev=$(partdev "$DISK" "$WIN_NUM") || die "partition Windows n°$WIN_NUM introuvable"
+  [[ $(blkid -p -s TYPE -o value "$dev" 2>/dev/null) == ntfs ]] || die "$dev n'est pas en NTFS : Windows n'est pas installé"
+  findmnt -S "$dev" >/dev/null && die "$dev est monté : démonte-le d'abord"
+
+  phase 0 70 "Pilotes réseau (catalogue Microsoft Update)"
+  local dirs=()
+  mapfile -t dirs < <(fetch_net_drivers)
+  ((${#dirs[@]})) || die "aucun pilote trouvé pour les cartes réseau de ce PC"
+
+  phase 70 95 "Copie sur la partition Windows ($dev)"
+  local mnt
+  mnt=$(mktemp -d)
+  # ntfs3 refuse un volume que Windows n'a pas fermé (hibernation, démarrage rapide)
+  if ! mount -t ntfs3 "$dev" "$mnt" 2>/dev/null && ! { command -v ntfs-3g >/dev/null && ntfs-3g "$dev" "$mnt" 2>/dev/null; }; then
+    rmdir "$mnt"
+    die "impossible de monter $dev : Windows n'est pas complètement arrêté. Sous Windows, ouvre une invite de commandes administrateur, tape « powercfg /h off » puis redémarre vers Linux."
+  fi
+  trap 'umount -q "'"$mnt"'" 2>/dev/null; rmdir "'"$mnt"'" 2>/dev/null' EXIT
+  rm -rf "$mnt/linwin/drivers"
+  local n=0 d
+  for d in "${dirs[@]}"; do
+    n=$((n + 1))
+    mkdir -p "$mnt/linwin/drivers/net/$n"
+    cp -r "$d"/. "$mnt/linwin/drivers/net/$n/"
+    echo "  $(sed -n 1p "$d/linwin-source.txt")"
+  done
+  # ASCII pur et fins de ligne CRLF : cmd.exe lit ce fichier dans la page de code OEM
+  sed 's/$/\r/' >"$mnt/linwin/installer-pilotes.cmd" <<'EOF'
+@echo off
+rem linwin : installe les pilotes reseau copies depuis Linux
+net session >nul 2>&1 || (powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs" & exit /b)
+pnputil /add-driver "%~dp0drivers\net\*.inf" /subdirs /install
+echo.
+echo Termine. Si le reseau n'apparait pas tout de suite, redemarre Windows.
+pause
+EOF
+  phase 95 100 "Synchronisation"
+  sync
+  umount "$mnt"
+  rmdir "$mnt"
+  trap - EXIT
+  # installation terminée : le cache n'a plus d'usage (les pilotes sont sur C:)
+  [[ $src == "$STATE.done" ]] && rm -rf "$DRV_CACHE"
+  progress 100
+  echo "OK. Sous Windows : double-clique sur C:\\linwin\\installer-pilotes.cmd (accepte la demande d'administrateur)."
+}
+
+# Annule l'installation, à n'importe quelle étape, y compris après « finish » :
+# supprime MSR, Windows et WINSETUP, retire les entrées de démarrage de Windows.
+# En mode « shrink », rend ensuite l'espace à Linux (partition, LUKS, Btrfs,
+# agrandis à chaud) ; en mode « free », l'espace redevient non alloué.
+# Relançable : si le noyau ne voit pas la nouvelle taille, on redémarre et on relance.
+cmd_cancel() {
+  as_root cancel "$@"
+  local yes=0 key_stdin=0 key=""
+  while (($#)); do
+    case $1 in
+    --yes) yes=1; shift ;;
+    --key-stdin) key_stdin=1; shift ;;
+    *) die "option inconnue : $1" ;;
+    esac
+  done
+  local src=$STATE
+  [[ -f $src ]] || src=$STATE.done
+  [[ -f $src ]] || die "aucune installation à annuler ($STATE introuvable)"
+  MODE=shrink MSR_START=0 WIN_START=0 STAGE_START=0 LINUX_BOOT= STAGED=0 UNATTENDED=0 VMD_DRIVER=0 NET_DRIVERS=0 STAGE_PARTUUID=
+  # shellcheck disable=SC1090
+  source "$src"
+  local mode=$MODE s_disk=$DISK s_part=$PART_NUM msr=$MSR_NUM win=$WIN_NUM stg=$STAGE_NUM
+  local -A s_start=(["$MSR_NUM"]=$MSR_START ["$WIN_NUM"]=$WIN_START ["$STAGE_NUM"]=$STAGE_START)
+  detect
+  [[ $DISK == "$s_disk" ]] || die "la partition EFI est sur /dev/$DISK, pas sur /dev/$s_disk enregistré : arrêt"
+  if [[ $mode == shrink ]]; then
+    [[ $PART_NUM == "$s_part" ]] ||
+      die "Linux est sur /dev/$ROOT_PART, pas sur la partition n°$s_part de /dev/$s_disk enregistrée : arrêt"
+    ((SHRINK_OK)) || die "Linux ne peut plus être agrandi à chaud ($SHRINK_WHY) : arrêt"
+  fi
+  require_ac
+
+  # Vérifie, sur la table du disque, que les partitions à supprimer sont bien les nôtres
+  local table num start size type name lin_end=0 next=$((LAST_LBA + 1)) ours=() win_present=0
+  table=$(part_table "$DISK")
+  while read -r num start size type name; do
+    if [[ $mode == shrink ]] && ((num == PART_NUM)); then
+      lin_end=$((start + size))
+      ((start == START)) || die "début de la partition Linux inattendu : arrêt"
+      continue
+    fi
+    case $num in
+    "$msr") [[ $type == "$TYPE_MSR" ]] || die "la partition n°$num n'est pas une MSR : arrêt" ;;
+    "$win") [[ $type == "$TYPE_BASIC" ]] || die "la partition n°$num n'est pas la partition Windows : arrêt"; win_present=1 ;;
+    "$stg") [[ $type == "$TYPE_BASIC" ]] || die "la partition n°$num n'est pas $STAGE_LABEL : arrêt" ;;
+    *)
+      [[ $mode == shrink ]] && ((start > START && start < next)) && next=$start
+      continue
+      ;;
+    esac
+    # début enregistré par « prepare » (états récents) : il doit correspondre
+    [[ ${s_start[$num]:-0} == 0 || ${s_start[$num]} == "$start" ]] || die "la partition n°$num n'est pas à l'emplacement enregistré : arrêt"
+    [[ $mode == free ]] || ((start > START)) || die "la partition n°$num précède Linux : arrêt"
+    ours+=("$num")
+  done <<<"$table"
+  local new_size=$SIZE
+  if [[ $mode == shrink ]]; then
+    ((lin_end > 0)) || die "partition Linux introuvable dans la table"
+    # une partition étrangère entre Linux et les nôtres : on ne touche à rien
+    for num in "${ours[@]}"; do
+      start=$(awk -v n="$num" '$1 == n {print $2}' <<<"$table")
+      ((start < next)) || die "une partition étrangère précède la n°$num : arrêt"
+    done
+    new_size=$(((next - START) / MIB * MIB))
+    ((new_size >= SIZE)) || die "calcul incohérent (la partition Linux rétrécirait) : arrêt"
+  fi
+  local dev
+  for num in "${ours[@]}"; do
+    dev=$(partdev "$DISK" "$num") || continue
+    [[ -z $(findmnt -rno TARGET -S "$dev") ]] || [[ $num == "$stg" ]] ||
+      die "$dev est montée : démonte-la d'abord"
+    grep -q "^$dev " /proc/swaps && die "$dev sert de swap : arrêt"
+  done
+
+  cat <<EOF
+Annulation de l'installation de Windows :
+$( ((${#ours[@]})) && echo "  - partitions supprimées : n°${ours[*]}$( ((win_present)) && echo " (Windows et TOUT son contenu)")")
+  - entrées de démarrage de Windows et de l'installeur retirées
+EOF
+  if [[ $mode == shrink ]]; then
+    echo "  - partition Linux n°$PART_NUM : $(gib "$SIZE") → $(gib "$new_size"), puis LUKS et Btrfs agrandis"
+  else
+    echo "  - l'espace libéré redevient non alloué (Linux n'est pas modifié)"
+  fi
+  if ((key_stdin)); then
+    IFS= read -r key || [[ -n $key ]] || die "passphrase LUKS attendue sur l'entrée standard"
+  fi
+  if ((!yes)); then
+    local answer
+    read -rp "Tape OUI en majuscules pour continuer : " answer
+    [[ $answer == OUI ]] || die "annulé"
+  fi
+  if [[ $mode == shrink ]] && ((LUKS)) && [[ -n $key ]]; then
+    printf '%s' "$key" | cryptsetup open --test-passphrase --key-file=- "/dev/$PART" ||
+      die "passphrase LUKS incorrecte : rien n'a été modifié"
+  fi
+  remove_auto_finish
+
+  phase 0 15 "Retrait des entrées de démarrage"
+  efibootmgr | grep -q '^BootNext:' && efibootmgr -q -N
+  if [[ ${STAGE_PARTUUID:-0} == 0 ]] && dev=$(partdev "$DISK" "$stg"); then
+    STAGE_PARTUUID=$(blkid -s PARTUUID -o value "$dev" 2>/dev/null || true)
+  fi
+  remove_stage_entries
+  local others old
+  # gestionnaire de Windows : supprimé seulement si aucun autre NTFS n'existe sur
+  # la machine (il pourrait servir à un autre Windows)
+  others=$(lsblk -rnpo NAME,FSTYPE | awk '$2 == "ntfs" {print $1}' | grep -vxF "$(partdev "$DISK" "$win" || echo none)" || true)
+  if [[ -d $ESP_DIR/EFI/Microsoft ]]; then
+    if [[ -z $others ]]; then
+      loader_remove_windows
+      for old in $(efibootmgr | grep -F "Windows Boot Manager" | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p' || true); do
+        efibootmgr -q -b "$old" -B
+      done
+      rm -rf "$ESP_DIR/EFI/Microsoft"
+    else
+      warn "autre partition NTFS trouvée ($others) : gestionnaire de démarrage Windows conservé"
+    fi
+  fi
+
+  phase 15 35 "Suppression des partitions de Windows"
+  for num in "${ours[@]}"; do
+    dev=$(partdev "$DISK" "$num") || continue
+    if [[ $num == "$stg" ]]; then
+      release_stage_dev "$dev"
+    else
+      # efface la signature NTFS : l'espace rendu ne garde pas de trace
+      wipefs -q -a "$dev" || true
+    fi
+  done
+  if ((${#ours[@]})); then
+    sfdisk --no-reread --no-tell-kernel --wipe never --delete "/dev/$DISK" "${ours[@]}"
+    for num in "${ours[@]}"; do partx -d --nr "$num" "/dev/$DISK" 2>/dev/null || true; done
+  fi
+
+  if [[ $mode == shrink ]]; then
+    phase 35 45 "Agrandissement de la partition Linux n°$PART_NUM"
+    if ((lin_end - START != new_size)); then
+      echo "$START, $new_size" | sfdisk --no-reread --no-tell-kernel --wipe never --wipe-partitions never -N "$PART_NUM" "/dev/$DISK"
+    fi
+    partx -u --nr "$PART_NUM" "/dev/$DISK" || true
+    udevadm settle 2>/dev/null || true
+    if (($(<"/sys/class/block/$PART/size") != new_size)); then
+      echo
+      echo "Partitions supprimées, mais le noyau n'a pas pu relire la table à chaud (sans danger)."
+      echo "Redémarre Linux, puis relance : $(basename "$SELF") cancel"
+      exit 3
+    fi
+
+    phase 45 90 "Agrandissement de LUKS et Btrfs"
+    if ((LUKS)); then
+      if [[ -n $key ]]; then
+        printf '%s' "$key" | cryptsetup resize --key-file=- "$DM_NAME"
+      else
+        cryptsetup resize "$DM_NAME"
+      fi
+    fi
+    btrfs filesystem resize "$BTRFS_DEVID:max" /
+  fi
+
+  phase 90 100 "Nettoyage"
+  rm -f /run/udev/rules.d/90-linwin.rules
+  udevadm control --reload 2>/dev/null || true
+  rm -rf "$STATE_DIR"
+  progress 100
+  echo
+  if [[ $mode == shrink ]]; then
+    echo "Terminé : Windows est retiré, Btrfs fait maintenant $(btrfs filesystem usage -b / | awk '/Device size:/ {printf "%.0f Gio", $3 / 1073741824}')."
+  else
+    echo "Terminé : Windows est retiré ; son espace est de nouveau non alloué sur /dev/$DISK."
+  fi
+}
+
+# Chaîne JSON sans dépendre de python (status doit marcher partout)
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\} s=${s//\"/\\\"} s=${s//$'\n'/\\n} s=${s//$'\t'/\\t} s=${s//$'\r'/}
+  printf '"%s"\n' "$s"
+}
+json_bool() { (($1)) && echo true || echo false; }
+
+# État lisible par machine, utilisé par l'interface graphique. Ne modifie rien.
+cmd_status() {
+  local err max_win=0 free_max=0 shrink_max=0 esp_avail=0 vmd=0 sb prepared=0 finished=0 staged=0
+  local entry=0 bootnext=0 windows=0 win_num=0 part_num=0 efi ours kind=inconnu
+  SHRINK_OK=0 SHRINK_WHY="" FREE_SIZE=0 ROOT_FS="" ROOT_PART="" ESP_DIR="" ESP_DEV=""
+  if err=$( (detect) 2>&1 >/dev/null); then
+    detect
+    free_max=$(free_max_gib) shrink_max=$(shrink_max_gib)
+    max_win=$((free_max > shrink_max ? free_max : shrink_max))
+    esp_avail=$(findmnt -bno AVAIL -M "$ESP_DIR" 2>/dev/null || echo 0)
+    kind=$(boot_loader_kind)
+  else
+    err=${err#ERREUR : }
+  fi
+  vmd_active && vmd=1
+  sb=$(od -An -t u1 /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | awk '{print $NF}' || true)
+  [[ -f $STATE.done ]] && finished=1
+  local needs_reboot=0 mode=""
+  if [[ -f $STATE ]]; then
+    load_state
+    prepared=1 staged=$STAGED win_num=$WIN_NUM part_num=$PART_NUM mode=$MODE
+    partdev "$DISK" "$STAGE_NUM" >/dev/null || needs_reboot=1
+    windows_installed && windows=1
+  elif ((finished)); then
+    MODE=shrink NET_DRIVERS=0 VMD_DRIVER=0 UNATTENDED=0
+    # shellcheck disable=SC1090
+    source "$STATE.done"
+    win_num=$WIN_NUM part_num=$PART_NUM mode=$MODE
+    windows_installed && windows=1
+  fi
+  efi=$(efibootmgr 2>/dev/null || true)
+  ours=$(grep -F "$EFI_LABEL" <<<"$efi" | sed -n 1p | sed -E 's/^Boot([0-9A-Fa-f]{4}).*/\1/' || true)
+  if [[ -n $ours ]]; then
+    entry=1
+    grep -q "^BootNext: $ours" <<<"$efi" && bootnext=1
+  fi
+  local net="" id name
+  while IFS='|' read -r id name; do
+    [[ -n $id ]] || continue
+    net+="${net:+, }{\"id\": $(json_str "$id"), \"name\": $(json_str "$name"), \"cached\": $(drv_cached "$id" && echo true || echo false)}"
+  done < <(net_devices)
+  cat <<EOF
+{
+  "error": $(json_str "$err"),
+  "distro": $(json_str "$(distro_name)"),
+  "init": $(json_str "$(init_kind)"),
+  "disk": $(json_str "${DISK:-}"),
+  "part": $(json_str "${ROOT_PART:-}"),
+  "root_fs": $(json_str "${ROOT_FS:-}"),
+  "luks": $(json_bool "${LUKS:-0}"),
+  "esp_dir": $(json_str "${ESP_DIR:-}"),
+  "esp_dev": $(json_str "${ESP_DEV:-}"),
+  "loader": $(json_str "$kind"),
+  "loader_label": $(json_str "$(loader_label "$kind")"),
+  "free_gib": $((${FREE_SIZE:-0} / MIB / 1024)),
+  "free_max_gib": $free_max,
+  "shrink_ok": $(json_bool "${SHRINK_OK:-0}"),
+  "shrink_why": $(json_str "${SHRINK_WHY:-}"),
+  "shrink_max_gib": $shrink_max,
+  "btrfs_size_gib": $((${BTRFS_SIZE:-0} / 1073741824)),
+  "btrfs_unalloc_gib": $((${BTRFS_UNALLOC:-0} / 1073741824)),
+  "max_win_gib": $max_win,
+  "esp_free_mib": $((esp_avail / 1048576)),
+  "vmd": $(json_bool $vmd),
+  "running": $(op_running && echo true || echo false),
+  "run_log": $(json_str "$RUN_LOG"),
+  "vmd_ids": $(json_str "$(vmd_ids | paste -sd ' ')"),
+  "vmd_rst": $(rst_covers && echo true || echo false),
+  "vmd_driver_cached": $(rst_cached && echo true || echo false),
+  "net": [$net],
+  "net_drivers": ${NET_DRIVERS:-0},
+  "secure_boot": $([[ $sb == 1 ]] && echo true || echo false),
+  "oem_license": $(oem_license && echo true || echo false),
+  "installed": $(installed_trusted && echo true || echo false),
+  "installed_bin": $(json_str "$INSTALLED_BIN"),
+  "on_ac": $( (require_ac) 2>/dev/null && echo true || echo false),
+  "mode": $(json_str "$mode"),
+  "prepared": $(json_bool $prepared),
+  "needs_reboot": $(json_bool $needs_reboot),
+  "part_num": $part_num,
+  "win_num": $win_num,
+  "staged": $(json_bool "$staged"),
+  "unattended": $(json_bool "${UNATTENDED:-0}"),
+  "auto_finish": $(auto_finish_installed && echo true || echo false),
+  "boot_entry": $(json_bool $entry),
+  "bootnext": $(json_bool $bootnext),
+  "windows_installed": $(json_bool $windows),
+  "finished": $(json_bool $finished)
+}
+EOF
+}
+
+usage() {
+  cat <<EOF
+linwin v$VERSION — Windows 10 en dual-boot natif depuis Linux, sans clé USB
+Toutes distributions ; PC x86-64 en UEFI, disque GPT. Place prise dans l'espace non
+alloué du disque de la partition EFI, sinon en réduisant à chaud une racine Btrfs.
+
+Usage : $(basename "$SELF") [--progress] <commande> [options]
+
+  --progress                     émet des lignes « @@progress POURCENT LIBELLÉ »
+                                 (utilisé par l'interface pour sa barre de progression)
+
+  --version                      affiche la version
+
+  install                        installe une copie root:root dans $INSTALL_DIR (root)
+  check                          compatibilité du PC, place disponible, chargeur, pilotes
+  status                         état complet en JSON (pour l'interface graphique)
+  plan    --size 100G            affiche le partitionnement prévu (ne modifie rien)
+  iso     [--lang French]        télécharge l'ISO Windows 10 22H2 dans ~/Downloads
+                                 (langue par défaut : celle de Linux)
+  prepare --size 100G            crée MSR + Windows + $STAGE_LABEL dans l'espace libre, ou
+                                 en réduisant Linux s'il le faut (root)
+  stage   --iso FICHIER          copie l'installeur sur $STAGE_LABEL (root)
+          [--vmd-driver DOSSIER] autre pilote VMD (sinon, si VMD est actif : Intel RST
+                                 20.2.6.1025, ou le pilote du catalogue Microsoft Update)
+          [--no-net-drivers]     sans les pilotes réseau du catalogue Microsoft Update
+                                 (ajoutés par défaut pour chaque carte Ethernet/Wi-Fi)
+          [--edition Pro --user NOM [--password-stdin]]
+                                 installation sans intervention (édition Home, Pro ou
+                                 Education, compte local NOM, mot de passe lu sur stdin)
+  boot                           démarre l'installeur au prochain redémarrage (root)
+  drivers                        copie les pilotes réseau sur un Windows déjà installé, avec
+                                 C:\\linwin\\installer-pilotes.cmd pour l'installer (root)
+  finish                         après l'installation : nettoyage + Windows dans le menu
+                                 du chargeur (GRUB, systemd-boot, Limine, rEFInd) (root)
+                                 (automatique au démarrage de Linux en mode sans intervention)
+  cancel  [--yes] [--key-stdin]  annule l'installation à n'importe quelle étape, même
+                                 terminée : supprime Windows et rend l'espace à Linux (root)
+
+Options de prepare/plan : --stage-size 8G (taille de $STAGE_LABEL)
+                          --mode free|shrink (impose la source d'espace)
+Options de prepare      : --yes (sans confirmation), --key-stdin (passphrase LUKS sur stdin)
+
+Interface graphique : linwin-gui
+EOF
+}
+
+if [[ ${1:-} == --progress ]]; then
+  PROGRESS=1
+  shift
+fi
+
+case ${1:-} in
+install) shift; cmd_install "$@" ;;
+check) shift; cmd_check "$@" ;;
+status) shift; cmd_status "$@" ;;
+plan) shift; cmd_plan "$@" ;;
+iso) shift; cmd_iso "$@" ;;
+prepare) shift; cmd_prepare "$@" ;;
+stage) shift; cmd_stage "$@" ;;
+boot) shift; cmd_boot "$@" ;;
+finish) shift; cmd_finish "$@" ;;
+drivers) shift; cmd_drivers "$@" ;;
+cancel) shift; cmd_cancel "$@" ;;
+-V | --version | version) echo "linwin v$VERSION" ;;
+-h | --help | help | "") usage ;;
+*) usage; exit 1 ;;
+esac

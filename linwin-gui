@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""linwin-gui — interface graphique de linwin v1.
+
+L'interface ne fait rien elle-même : elle lit l'état avec « linwin status »
+et lance les étapes de la CLI (via pkexec pour celles qui exigent root). La CLI
+reste la seule source de vérité, l'interface et le terminal restent cohérents.
+
+Sécurité : pkexec ne lance JAMAIS un script modifiable par l'utilisateur, seulement
+la copie root:root installée par « linwin install ». Sinon, n'importe quel
+programme de la session pourrait modifier le script puis attendre que l'utilisateur
+accepte la demande de mot de passe.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+# libadwaita 1.5 au minimum (AlertDialog) : Ubuntu 24.04, Fedora 40, Debian 13…
+ADW_OK = (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 5)
+
+VERSION = "1"
+APP_ID = "io.github._2Deathadder.linwin"
+HERE = os.path.dirname(os.path.realpath(__file__))
+LOCAL_CLI = os.path.join(HERE, "linwin")
+INSTALLED_CLI = "/usr/local/lib/linwin/linwin"
+LOCK = "/run/linwin.lock"
+RUN_LOG = "/run/linwin.log"
+
+
+def op_running():
+    """Vrai si une opération de la CLI tient son verrou (lu dans /proc/locks, sans le prendre)."""
+    try:
+        ino = os.stat(LOCK).st_ino
+        with open("/proc/locks") as f:
+            return any(l.split()[1] == "FLOCK" and l.split()[5].endswith(f":{ino}") for l in f if len(l.split()) > 5)
+    except OSError:
+        return False
+
+
+def trusted(path):
+    """root:root et non modifiable par d'autres, dossiers parents compris."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        p = path
+        while True:
+            st = os.stat(p)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                return False
+            if p == "/":
+                return True
+            p = os.path.dirname(p)
+    except OSError:
+        return False
+
+
+def cli():
+    """La CLI à lancer en root : la copie de confiance si elle existe."""
+    return INSTALLED_CLI if trusted(INSTALLED_CLI) else LOCAL_CLI
+
+
+def outdated():
+    """Vrai si la copie installée diffère des fichiers de ce dossier (mise à jour à installer)."""
+    installed_dir = os.path.dirname(INSTALLED_CLI)
+    for name in ("linwin", "linwin-gui"):
+        try:
+            with open(os.path.join(HERE, name), "rb") as a, open(os.path.join(installed_dir, name), "rb") as b:
+                if a.read() != b.read():
+                    return True
+        except OSError:
+            return True
+    return False
+CONFIG = os.path.join(GLib.get_user_config_dir(), "linwin", "gui.json")
+LEGACY_CONFIG = os.path.join(GLib.get_user_config_dir(), "win-dualboot", "gui.json")  # avant la v1
+WIN10_PAGE = "https://www.microsoft.com/fr-fr/software-download/windows10ISO"
+PROGRESS_RE = re.compile(r"^@@progress (\d+) (.*)$")
+DEFAULT_DRIVER = "Automatique si VMD est actif : Intel RST 20.2.6.1025, sinon catalogue Microsoft Update"
+
+EDITIONS = (("Home", "Famille"), ("Pro", "Professionnel"), ("Education", "Éducation"))
+USER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,19}$")
+RESERVED_USERS = {"administrator", "administrateur", "guest", "invité", "defaultaccount"}
+
+ICON_DONE = "emblem-ok-symbolic"
+ICON_TODO = "go-next-symbolic"
+ICON_WAIT = "content-loading-symbolic"
+ICON_BLOCKED = "action-unavailable-symbolic"
+
+CSS = b"""
+.step-done { color: @success_color; }
+.step-todo { color: @accent_color; }
+.step-blocked { color: @warning_color; }
+.log { font-family: monospace; font-size: 0.9em; }
+"""
+
+
+def load_config():
+    for path in (CONFIG, LEGACY_CONFIG):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def make_spinner():
+    """Adw.Spinner (libadwaita 1.6+), sinon Gtk.Spinner."""
+    if hasattr(Adw, "Spinner"):
+        return Adw.Spinner(visible=False)
+    spinner = Gtk.Spinner(visible=False)
+    spinner.start()
+    return spinner
+
+
+def reboot():
+    """Redémarre avec ce que propose le système (systemd, elogind, sinon root)."""
+    for cmd in (["systemctl", "reboot"], ["loginctl", "reboot"], ["pkexec", "reboot"]):
+        if GLib.find_program_in_path(cmd[0]):
+            subprocess.Popen(cmd)
+            return
+
+
+def find_iso():
+    for pattern in ("~/Downloads/**/Win10*.iso", "~/Downloads/**/*indows*10*.iso"):
+        hits = glob.glob(os.path.expanduser(pattern), recursive=True)
+        if hits:
+            return max(hits, key=os.path.getmtime)
+    return ""
+
+
+class Step:
+    """Une ligne d'étape : icône d'état + titre + bouton d'action."""
+
+    def __init__(self, number, title, button_label, on_click, destructive=False):
+        self.row = Adw.ActionRow(title=f"{number}. {title}")
+        self.icon = Gtk.Image(icon_name=ICON_WAIT)
+        self.row.add_prefix(self.icon)
+        self.button = Gtk.Button(label=button_label, valign=Gtk.Align.CENTER)
+        self.button.add_css_class("destructive-action" if destructive else "suggested-action")
+        self.button.connect("clicked", lambda *_: on_click())
+        self.row.add_suffix(self.button)
+
+    def set(self, state, subtitle, enabled):
+        icon, css = {
+            "done": (ICON_DONE, "step-done"),
+            "todo": (ICON_TODO, "step-todo"),
+            "blocked": (ICON_BLOCKED, "step-blocked"),
+            "wait": (ICON_WAIT, None),
+        }[state]
+        self.icon.set_from_icon_name(icon)
+        for c in ("step-done", "step-todo", "step-blocked"):
+            self.icon.remove_css_class(c)
+        if css:
+            self.icon.add_css_class(css)
+        self.row.set_subtitle(GLib.markup_escape_text(subtitle))
+        self.button.set_sensitive(enabled)
+        self.button.set_visible(state != "done" and (state != "wait" or enabled))
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=f"linwin v{VERSION}")
+        self.set_default_size(860, 820)
+        self.cfg = load_config()
+        if not self.cfg.get("iso") or not os.path.isfile(self.cfg["iso"]):
+            self.cfg["iso"] = find_iso()
+        self.status = {}
+        self.busy = False
+        self.plan_timer = 0
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title=f"linwin v{VERSION}", subtitle="Windows en dual-boot natif, sans clé USB"))
+        self.spinner = make_spinner()
+        header.pack_start(self.spinner)
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Actualiser l'état")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        header.pack_end(refresh)
+        view.add_top_bar(header)
+
+        self.banner = Adw.Banner(revealed=False)
+        self.banner.connect("button-clicked", lambda *_: self.show_vmd_help())
+        view.add_top_bar(self.banner)
+
+        page = Adw.PreferencesPage()
+
+        # --- machine ---
+        machine = Adw.PreferencesGroup(title="Cette machine")
+        self.row_system = Adw.ActionRow(title="Système")
+        self.row_disk = Adw.ActionRow(title="Disque de Windows")
+        self.row_space = Adw.ActionRow(title="Place pour Windows")
+        self.row_esp = Adw.ActionRow(title="Partition EFI")
+        self.row_vmd = Adw.ActionRow(title="Intel VMD")
+        self.row_net = Adw.ActionRow(title="Réseau")
+        self.row_license = Adw.ActionRow(title="Licence Windows du firmware")
+        self.row_power = Adw.ActionRow(title="Alimentation")
+        self.row_trust = Adw.ActionRow(title="Outil installé (root:root)")
+        for r in (self.row_system, self.row_disk, self.row_space, self.row_esp, self.row_vmd, self.row_net, self.row_license, self.row_power, self.row_trust):
+            r.add_css_class("property")
+            machine.add(r)
+        page.add(machine)
+
+        # --- réglages ---
+        settings = Adw.PreferencesGroup(title="Réglages")
+        self.row_iso = Adw.ActionRow(title="Image Windows 10 (ISO)")
+        dl = Gtk.Button(icon_name="folder-download-symbolic", tooltip_text="Télécharger depuis Microsoft", valign=Gtk.Align.CENTER)
+        dl.add_css_class("flat")
+        dl.connect("clicked", lambda *_: self.download_iso())
+        pick = Gtk.Button(label="Choisir…", valign=Gtk.Align.CENTER)
+        pick.connect("clicked", lambda *_: self.pick_iso())
+        self.row_iso.add_suffix(dl)
+        self.row_iso.add_suffix(pick)
+        self.iso_buttons = (dl, pick)
+        settings.add(self.row_iso)
+
+        self.row_size = Adw.SpinRow.new_with_range(32, 1000, 1)
+        self.row_size.set_title("Taille de Windows (Gio)")
+        self.row_size.set_value(self.cfg.get("size", 100))
+        self.row_size.connect("notify::value", lambda *_: self.on_size_changed())
+        settings.add(self.row_size)
+
+        self.row_plan = Adw.ExpanderRow(title="Partitionnement prévu", subtitle="")
+        self.plan_label = Gtk.Label(xalign=0, selectable=True, wrap=False, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        self.plan_label.add_css_class("log")
+        self.row_plan.add_row(self.plan_label)
+        settings.add(self.row_plan)
+
+        self.row_driver = Adw.ActionRow(title="Pilote VMD",
+                                        subtitle=DEFAULT_DRIVER)
+        drv_pick = Gtk.Button(label="Choisir…", valign=Gtk.Align.CENTER)
+        drv_pick.connect("clicked", lambda *_: self.pick_driver())
+        drv_clear = Gtk.Button(icon_name="edit-clear-symbolic", tooltip_text="Revenir au pilote automatique", valign=Gtk.Align.CENTER)
+        drv_clear.add_css_class("flat")
+        drv_clear.connect("clicked", lambda *_: self.set_driver(""))
+        self.row_driver.add_suffix(drv_clear)
+        self.row_driver.add_suffix(drv_pick)
+        self.driver_buttons = (drv_pick, drv_clear)
+        settings.add(self.row_driver)
+        page.add(settings)
+
+        # --- installation sans intervention ---
+        auto = Adw.PreferencesGroup(title="Installation sans intervention",
+                                    description="Windows s'installe, crée le compte et revient sous Linux tout seul.")
+        self.row_auto = Adw.SwitchRow(title="Zéro intervention", subtitle="Sinon, l'installeur Windows pose ses questions")
+        self.row_auto.set_active(self.cfg.get("unattended", True))
+        self.row_auto.connect("notify::active", lambda *_: self.on_auto_changed())
+        auto.add(self.row_auto)
+        self.row_edition = Adw.ComboRow(title="Édition", model=Gtk.StringList.new([e[1] for e in EDITIONS]))
+        # licence OEM dans le firmware : en général Famille, qui s'activera alors toute seule
+        default = 0 if os.path.exists("/sys/firmware/acpi/tables/MSDM") else 1
+        self.row_edition.set_selected(next((i for i, e in enumerate(EDITIONS) if e[0] == self.cfg.get("edition")), default))
+        self.row_edition.connect("notify::selected", lambda *_: self.on_auto_changed())
+        auto.add(self.row_edition)
+        self.row_user = Adw.EntryRow(title="Nom du compte Windows")
+        self.row_user.set_text(self.cfg.get("user", GLib.get_user_name()))
+        self.row_user.connect("changed", lambda *_: self.on_auto_changed())
+        auto.add(self.row_user)
+        self.row_password = Adw.PasswordEntryRow(title="Mot de passe Windows (peut rester vide)")
+        auto.add(self.row_password)
+        self.auto_rows = (self.row_edition, self.row_user, self.row_password)
+        page.add(auto)
+
+        # --- étapes ---
+        steps = Adw.PreferencesGroup(title="Étapes", description="Chaque étape se débloque quand la précédente est faite.")
+        self.s_prepare = Step(1, "Préparer le disque", "Préparer…", self.do_prepare, destructive=True)
+        self.s_stage = Step(2, "Copier l'installeur", "Copier", self.do_stage)
+        self.s_boot = Step(3, "Démarrer l'installeur", "Programmer", self.do_boot)
+        self.s_install = Step(4, "Installer Windows", "Instructions", self.show_install_help)
+        self.s_finish = Step(5, "Finaliser", "Finaliser", self.do_finish)
+        self.s_install.button.remove_css_class("suggested-action")
+        self.all_steps = (self.s_prepare, self.s_stage, self.s_boot, self.s_install, self.s_finish)
+        for s in self.all_steps:
+            steps.add(s.row)
+        page.add(steps)
+
+        # --- pilotes pour un Windows déjà installé ---
+        drivers_group = Adw.PreferencesGroup(title="Pilotes")
+        self.row_drivers = Adw.ActionRow(title="Pilotes réseau pour ce Windows",
+                                         subtitle="Copie sur C: les pilotes Ethernet/Wi-Fi du catalogue Microsoft, "
+                                                  "avec C:\\linwin\\installer-pilotes.cmd pour les installer")
+        self.drivers_button = Gtk.Button(label="Copier", valign=Gtk.Align.CENTER)
+        self.drivers_button.connect("clicked", lambda *_: self.do_drivers())
+        self.row_drivers.add_suffix(self.drivers_button)
+        drivers_group.add(self.row_drivers)
+        self.drivers_group = drivers_group
+        page.add(drivers_group)
+
+        # --- annulation ---
+        cancel_group = Adw.PreferencesGroup(title="Annuler")
+        self.row_cancel = Adw.ActionRow(title="Annuler l'installation")
+        self.cancel_button = Gtk.Button(label="Annuler…", valign=Gtk.Align.CENTER)
+        self.cancel_button.add_css_class("destructive-action")
+        self.cancel_button.connect("clicked", lambda *_: self.do_cancel())
+        self.row_cancel.add_suffix(self.cancel_button)
+        cancel_group.add(self.row_cancel)
+        self.cancel_group = cancel_group
+        page.add(cancel_group)
+
+        # --- progression (lignes « @@progress » de la CLI) : barre fixe en bas de la
+        # fenêtre, visible sans faire défiler la page ---
+        self.progress_group = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, visible=False,
+                                      margin_top=10, margin_bottom=10, margin_start=16, margin_end=16)
+        self.progress_label = Gtk.Label(xalign=0, wrap=True)
+        self.progress_label.add_css_class("heading")
+        self.progress_bar = Gtk.ProgressBar(show_text=True)
+        self.progress_eta = Gtk.Label(xalign=0)
+        self.progress_eta.add_css_class("dim-label")
+        self.progress_eta.add_css_class("caption")
+        for w in (self.progress_label, self.progress_bar, self.progress_eta):
+            self.progress_group.append(w)
+        view.add_bottom_bar(self.progress_group)
+        self.progress_start = 0.0
+        self.progress_run = 0  # numéro de l'opération en cours
+        self.following = False  # suivi d'une opération lancée par une autre fenêtre
+
+        # --- journal ---
+        log_group = Adw.PreferencesGroup(title="Journal")
+        self.log_buffer = Gtk.TextBuffer()
+        log_view = Gtk.TextView(buffer=self.log_buffer, editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                top_margin=8, bottom_margin=8, left_margin=8, right_margin=8)
+        log_view.add_css_class("log")
+        self.log_view = log_view
+        self.log_end = self.log_buffer.create_mark("end", self.log_buffer.get_end_iter(), False)
+        scroller = Gtk.ScrolledWindow(child=log_view, min_content_height=220)
+        scroller.add_css_class("card")
+        log_group.add(scroller)
+        page.add(log_group)
+
+        view.set_content(page)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        self.update_iso_row()
+        self.update_driver_row()
+        self.refresh()
+
+    # --- utilitaires -------------------------------------------------------------
+
+    def log(self, text):
+        self.log_buffer.insert(self.log_buffer.get_end_iter(), text)
+        self.log_view.scroll_mark_onscreen(self.log_end)
+
+    def toast(self, text, button=None, action=None):
+        t = Adw.Toast(title=text, timeout=6)
+        if button:
+            t.set_button_label(button)
+            t.connect("button-clicked", lambda *_: action())
+        self.toasts.add_toast(t)
+
+    def set_progress(self, percent, label):
+        if not self.progress_group.get_visible():
+            self.progress_group.set_visible(True)
+            self.progress_start = time.monotonic()
+        self.progress_label.set_label(label)
+        self.progress_bar.set_fraction(percent / 100)
+        self.progress_bar.set_text(f"{percent} %")
+        # estimation : les plages de la CLI sont pondérées par la durée de chaque phase
+        elapsed = time.monotonic() - self.progress_start
+        if 3 <= percent < 100 and elapsed > 30:
+            left = elapsed * (100 - percent) / percent
+            self.progress_eta.set_label(f"Encore environ {max(1, round(left / 60))} min")
+        else:
+            self.progress_eta.set_label("")
+
+    def end_progress(self, ok):
+        if not self.progress_group.get_visible():
+            return
+        if ok:
+            self.progress_bar.set_fraction(1)
+            self.progress_bar.set_text("100 %")
+            self.progress_eta.set_label("Terminé")
+        else:
+            self.progress_eta.set_label("Interrompu : voir le journal")
+        run_id = self.progress_run
+
+        def hide():
+            if self.progress_run == run_id and not self.busy:
+                self.progress_group.set_visible(False)
+            return False
+
+        GLib.timeout_add_seconds(8 if ok else 30, hide)
+
+    def handle_output(self, raw, output):
+        # les barres de progression réécrivent la ligne avec \r : on garde la dernière
+        line = bytes(raw).decode("utf-8", "replace").split("\r")[-1]
+        m = PROGRESS_RE.match(line)
+        if m:
+            self.set_progress(int(m.group(1)), m.group(2))
+        elif not line.startswith("@@"):
+            output.append(line)
+            self.log(line + "\n")
+
+    def follow_running(self):
+        if self.busy or self.following:
+            return
+        """Une opération tourne sans nous (fenêtre fermée puis rouverte) : on relit
+        son journal depuis le début, puis on le suit jusqu'à la fin de l'opération."""
+        self.following = True
+        self.set_busy(True)
+        self.progress_run += 1
+        self.log("\n--- Opération en cours, lancée avant l'ouverture de cette fenêtre ---\n")
+        state = {"offset": 0, "pending": bytearray(), "output": []}
+
+        def poll():
+            alive = op_running()
+            try:
+                with open(RUN_LOG, "rb") as f:
+                    f.seek(state["offset"])
+                    data = f.read()
+            except OSError:
+                data = b""
+            state["offset"] += len(data)
+            buf = state["pending"]
+            buf.extend(data)
+            while (i := buf.find(b"\n")) >= 0:
+                self.handle_output(buf[:i], state["output"])
+                del buf[:i + 1]
+            if alive:
+                return True
+            # fin : le code de sortie n'est pas connu, le journal dit si ça a échoué
+            failed = any(l.startswith("ERREUR") for l in state["output"][-20:])
+            self.log("--- Opération terminée ---\n")
+            self.following = False
+            self.end_progress(not failed)
+            GLib.idle_add(lambda: self.set_busy(False) and False)
+            return False
+
+        if poll():
+            GLib.timeout_add_seconds(1, poll)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.spinner.set_visible(busy)
+        for b in self.iso_buttons + self.driver_buttons:
+            b.set_sensitive(not busy)
+        self.row_size.set_sensitive(not busy)
+        self.row_auto.set_sensitive(not busy)
+        if busy:
+            self.cancel_button.set_sensitive(False)
+            for s in self.all_steps:
+                s.button.set_sensitive(False)
+        else:
+            self.refresh()
+
+    def run(self, argv, root=False, stdin=None, on_done=None, bootstrap=False):
+        """Lance la CLI en arrière-plan et recopie sa sortie dans le journal.
+
+        root : via pkexec, uniquement sur la copie de confiance (sinon on propose
+        de l'installer). bootstrap : la seule exception, « install » lui-même,
+        après confirmation explicite de l'utilisateur.
+        """
+        if self.busy:
+            return
+        if root and not bootstrap and (not trusted(INSTALLED_CLI) or outdated()):
+            self.ask_install(lambda: self.run(argv, root, stdin, on_done))
+            return
+        # sans root, la CLI de ce dossier suffit (et elle est à jour)
+        exe = cli() if root and not bootstrap else LOCAL_CLI
+        cmd = (["pkexec", exe] if root else [exe]) + ["--progress"] + argv
+        self.log(f"\n$ {'pkexec ' if root else ''}linwin {' '.join(argv)}\n")
+        flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
+        if stdin is not None:
+            flags |= Gio.SubprocessFlags.STDIN_PIPE
+        try:
+            proc = Gio.Subprocess.new(cmd, flags)
+        except GLib.Error as e:
+            self.log(f"Impossible de lancer la commande : {e.message}\n")
+            return
+        self.set_busy(True)
+        self.progress_run += 1
+        self.progress_group.set_visible(False)
+        output = []
+        if stdin is not None:
+            pipe = proc.get_stdin_pipe()
+            pipe.write_all(stdin.encode(), None)
+            pipe.close(None)
+        stdout = proc.get_stdout_pipe()
+        pending = bytearray()
+
+        def on_text(raw):
+            self.handle_output(raw, output)
+
+        def on_chunk(src, res):
+            # lecture par blocs d'octets : un caractère non UTF-8 n'interrompt rien (sinon
+            # le tube se fermerait et la CLI mourrait sur « Broken pipe »), et un bloc
+            # vide signale sans ambiguïté la fin de la sortie
+            try:
+                data = src.read_bytes_finish(res).get_data()
+            except GLib.Error:
+                data = b""
+            if not data:
+                if pending:
+                    on_text(pending)
+                proc.wait_async(None, on_exit)
+                return
+            pending.extend(data)
+            while (i := pending.find(b"\n")) >= 0:
+                on_text(pending[:i])
+                del pending[:i + 1]
+            src.read_bytes_async(65536, GLib.PRIORITY_DEFAULT, None, on_chunk)
+
+        def on_exit(p, res):
+            p.wait_finish(res)
+            code = p.get_exit_status() if p.get_if_exited() else -1
+            if root and code in (126, 127):
+                self.log("Authentification annulée ou refusée.\n")
+            self.end_progress(code == 0)
+            self.set_busy(False)
+            if on_done:
+                on_done(code, output)
+
+        stdout.read_bytes_async(65536, GLib.PRIORITY_DEFAULT, None, on_chunk)
+
+    def refresh(self):
+        try:
+            out = subprocess.run([LOCAL_CLI, "status"], capture_output=True, text=True, timeout=30).stdout
+            self.status = json.loads(out)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            self.status = {"error": f"état illisible : {e}"}
+        self.update_view()
+        # même source que le suivi (op_running) : sinon un désaccord relancerait le suivi en boucle
+        if not self.busy and not self.following and op_running():
+            GLib.idle_add(lambda: self.follow_running() and False)
+
+    # --- affichage ---------------------------------------------------------------
+
+    def update_iso_row(self):
+        iso = self.cfg.get("iso", "")
+        if iso and os.path.isfile(iso):
+            size = os.path.getsize(iso) / 1024**3
+            self.row_iso.set_subtitle(GLib.markup_escape_text(f"{os.path.basename(iso)} — {size:.1f} Gio"))
+        else:
+            self.row_iso.set_subtitle("Aucune image choisie : télécharge-la ou choisis un fichier .iso")
+
+    def update_driver_row(self):
+        drv = self.cfg.get("driver", "")
+        self.row_driver.set_subtitle(GLib.markup_escape_text(drv) if drv else DEFAULT_DRIVER)
+
+    def update_view(self):
+        st = self.status
+        err = st.get("error")
+        iso_ok = os.path.isfile(self.cfg.get("iso", ""))
+        vmd = st.get("vmd", False)
+        prepared, finished = st.get("prepared", False), st.get("finished", False)
+        needs_reboot = st.get("needs_reboot", False)
+        staged, bootnext = st.get("staged", False), st.get("bootnext", False)
+        win_installed = st.get("windows_installed", False)
+
+        # bandeau
+        if err:
+            self.banner.set_title(GLib.markup_escape_text(f"Configuration non gérée : {err}"))
+            self.banner.set_button_label(None)
+            self.banner.set_revealed(True)
+        elif vmd and not staged and not finished:
+            self.banner.set_title("Intel VMD est actif : son pilote sera ajouté à l'installeur Windows.")
+            self.banner.set_button_label("Détails")
+            self.banner.set_revealed(True)
+        else:
+            self.banner.set_revealed(False)
+
+        # machine
+        self.row_system.set_subtitle(GLib.markup_escape_text(
+            f"{st.get('distro', 'Linux')} — chargeur {st.get('loader_label', '?')}, init {st.get('init', '?')}"))
+        if st.get("disk"):
+            self.row_disk.set_subtitle(f"/dev/{st['disk']} (celui de la partition EFI) — Linux : {st.get('root_fs', '?')} "
+                                       f"sur /dev/{st.get('part', '?')}" + (", chiffré (LUKS)" if st.get("luks") else ""))
+            space = f"{st.get('free_gib', 0)} Gio non alloués → jusqu'à {st.get('free_max_gib', 0)} Gio sans rien redimensionner"
+            if st.get("shrink_ok"):
+                space += f" ; en réduisant Linux (Btrfs) : jusqu'à {st.get('shrink_max_gib', 0)} Gio"
+            else:
+                space += f" ; Linux ne peut pas être réduit : {st.get('shrink_why', '')}"
+            self.row_space.set_subtitle(GLib.markup_escape_text(space))
+        else:
+            self.row_disk.set_subtitle("—")
+            self.row_space.set_subtitle("—")
+        esp = st.get("esp_free_mib", 0)
+        self.row_esp.set_subtitle(GLib.markup_escape_text(
+            f"{st.get('esp_dev', '?')} sur {st.get('esp_dir', '?')} — {esp} Mio libres"
+            + ("" if esp >= 100 else " — Windows a besoin d'environ 100 Mio")))
+        if not vmd:
+            self.row_vmd.set_subtitle("Inactif")
+        elif st.get("vmd_rst"):
+            self.row_vmd.set_subtitle("Actif — pilote Intel RST " + ("déjà téléchargé" if st.get("vmd_driver_cached") else "téléchargé à l'étape 2"))
+        else:
+            self.row_vmd.set_subtitle(f"Actif ({st.get('vmd_ids', '?')}) — pilote cherché dans le catalogue Microsoft à l'étape 2")
+        net = st.get("net", [])
+        if not net:
+            self.row_net.set_subtitle("Aucune carte réseau PCI détectée")
+        else:
+            names = ", ".join(n["name"] for n in net)
+            if st.get("net_drivers"):
+                state = f"{st['net_drivers']} pilote(s) ajouté(s) à l'installeur"
+            elif finished or win_installed:
+                state = "pilotes absents de ce Windows : « Pilotes » ci-dessous"
+            elif staged:
+                state = "aucun pilote ajouté : voir le journal de l'étape 2"
+            else:
+                state = "pilotes du catalogue Microsoft Update ajoutés à l'étape 2"
+            self.row_net.set_subtitle(GLib.markup_escape_text(f"{names} — {state}"))
+        self.row_license.set_subtitle("Présente : choisis Famille pour une activation automatique" if st.get("oem_license")
+                                      else "Absente : il faudra activer Windows avec ta propre licence")
+        on_ac = st.get("on_ac", True)
+        self.row_power.set_subtitle("Sur secteur" if on_ac else "Sur batterie — branche le chargeur")
+        self.row_trust.set_subtitle(f"Oui : {INSTALLED_CLI}" if st.get("installed")
+                                    else "Pas encore : proposé à la première étape qui demande root")
+
+        max_win = st.get("max_win_gib", 0)
+        if max_win >= 32:
+            self.row_size.get_adjustment().set_upper(max_win)
+        # verrouillés seulement pendant une installation en cours : une fois terminée
+        # (ou annulée), on peut de nouveau tout régler
+        locked = prepared and not finished
+        self.row_size.set_sensitive(not locked and not self.busy)
+        self.row_plan.set_sensitive(not locked)
+
+        # étapes
+        if finished:
+            self.s_prepare.set("done", "Disque partitionné — « Annuler l'installation » pour recommencer", False)
+        elif prepared:
+            sub = "Redémarre Linux pour que le noyau voie les nouvelles partitions" if needs_reboot else \
+                f"Partition Windows n°{st['win_num']} créée, Linux sur la n°{st['part_num']}"
+            self.s_prepare.set("blocked" if needs_reboot else "done", sub, False)
+        elif err:
+            self.s_prepare.set("blocked", "Disque non géré par l'outil", False)
+        elif not on_ac:
+            self.s_prepare.set("blocked", "Branche le chargeur : une coupure ici peut détruire Linux", False)
+        elif not iso_ok:
+            self.s_prepare.set("blocked", "Choisis d'abord l'image ISO (dans Réglages)", False)
+        else:
+            self.s_prepare.set("todo", "Réduit Linux et crée les partitions MSR, Windows et WINSETUP", not self.busy)
+
+        # une fois l'installeur copié, le mode est celui enregistré par la CLI
+        in_progress = staged and not finished
+        auto = st.get("unattended", False) if in_progress else self.row_auto.get_active()
+        self.row_auto.set_sensitive(not in_progress and not self.busy)
+        for r in self.auto_rows:
+            r.set_sensitive(auto and not in_progress and not self.busy)
+        auto_problem = self.auto_problem() if auto else None
+
+        if finished or staged:
+            self.s_stage.set("done", "Installeur copié sur WINSETUP" + (", en mode sans intervention" if auto else ""), False)
+        elif not prepared or needs_reboot:
+            self.s_stage.set("wait", "Après l'étape 1", False)
+        elif not iso_ok:
+            self.s_stage.set("blocked", "Choisis d'abord l'image ISO", False)
+        elif not on_ac:
+            self.s_stage.set("blocked", "Branche le chargeur", False)
+        elif auto_problem:
+            self.s_stage.set("blocked", auto_problem, False)
+        elif auto:
+            self.s_stage.set("todo", f"Copie l'ISO, extrait l'édition {EDITIONS[self.row_edition.get_selected()][1]} "
+                             "et prépare les réponses automatiques", not self.busy)
+        else:
+            self.s_stage.set("todo", "Formate WINSETUP et y copie l'ISO", not self.busy)
+
+        if finished or win_installed:
+            self.s_boot.set("done", "Installeur démarré", False)
+        elif bootnext:
+            self.s_boot.set("todo", "Programmé : redémarre pour lancer l'installeur", not self.busy)
+            self.s_boot.button.set_label("Redémarrer")
+        elif staged:
+            self.s_boot.set("todo", "Démarre l'installeur au prochain redémarrage (une seule fois)", not self.busy)
+            self.s_boot.button.set_label("Programmer")
+        else:
+            self.s_boot.set("wait", "Après l'étape 2", False)
+
+        if finished or win_installed:
+            self.s_install.set("done", "Windows est installé", False)
+        elif auto:
+            self.s_install.set("wait", "Automatique : rien à faire, compter 20 à 40 minutes", True)
+        elif bootnext or staged:
+            self.s_install.set("wait", f"Dans l'installeur : partition n°{st.get('win_num', '?')} uniquement", True)
+        else:
+            self.s_install.set("wait", "Se fait dans l'installeur Windows", True)
+
+        if finished:
+            self.s_finish.set("done", f"Terminé : Windows est dans le menu de {st.get('loader_label', '?')}", False)
+        elif prepared and win_installed:
+            self.s_finish.set("todo", f"Remet Linux en premier, supprime WINSETUP, ajoute Windows au menu de {st.get('loader_label', '?')}", not self.busy)
+        elif auto:
+            self.s_finish.set("wait", "Automatique au retour sous Linux", False)
+        else:
+            self.s_finish.set("wait", "Après l'installation de Windows", False)
+
+        # pilotes : pour un Windows installé sans eux (ou pour les réinstaller)
+        self.drivers_group.set_visible(bool(net) and (finished or win_installed))
+        self.drivers_button.set_sensitive(not self.busy)
+
+        # annulation : possible dès que l'outil a modifié le disque
+        self.cancel_group.set_visible(prepared or finished)
+        if win_installed or finished:
+            self.row_cancel.set_subtitle(f"Supprime Windows (partition n°{st.get('win_num') or '?'}, avec son contenu) "
+                                         + ("et rend tout son espace à Linux" if st.get("mode") == "shrink" else "; l'espace redevient libre"))
+        else:
+            self.row_cancel.set_subtitle("Supprime les partitions créées" + (" et rend leur espace à Linux" if st.get("mode") == "shrink" else ""))
+        self.cancel_button.set_sensitive(not self.busy and on_ac)
+
+        if not locked and not self.plan_label.get_label():
+            self.on_size_changed()
+
+    # --- réglages ----------------------------------------------------------------
+
+    def on_size_changed(self):
+        self.cfg["size"] = int(self.row_size.get_value())
+        save_config(self.cfg)
+        if self.plan_timer:
+            GLib.source_remove(self.plan_timer)
+        self.plan_timer = GLib.timeout_add(300, self.update_plan)
+
+    def on_auto_changed(self):
+        self.cfg["unattended"] = self.row_auto.get_active()
+        self.cfg["edition"] = EDITIONS[self.row_edition.get_selected()][0]
+        self.cfg["user"] = self.row_user.get_text()
+        save_config(self.cfg)
+        self.update_view()
+
+    def auto_problem(self):
+        """Ce qui empêche le mode sans intervention, ou None."""
+        user = self.row_user.get_text()
+        if not USER_RE.match(user):
+            return "Nom du compte invalide (lettres, chiffres, - et _, 20 max)"
+        if user.lower() in RESERVED_USERS:
+            return f"« {user} » est réservé par Windows"
+        return None
+
+    def update_plan(self):
+        self.plan_timer = 0
+        r = subprocess.run([LOCAL_CLI, "plan", "--size", f"{self.cfg['size']}G"], capture_output=True, text=True)
+        text = (r.stdout + r.stderr).strip()
+        self.plan_label.set_label(text)
+        lines = text.splitlines()
+        line = next((l for l in lines if "taille" in l or "Espace utilisé" in l), lines[-1] if lines else "")
+        if "taille" in line:
+            line = "Linux réduit : " + line.split(":", 1)[-1].strip()
+        elif "Espace utilisé" in line:
+            line = "Espace non alloué : aucune partition existante modifiée"
+        self.row_plan.set_subtitle(GLib.markup_escape_text(line))
+        return False
+
+    def pick_iso(self):
+        dialog = Gtk.FileDialog(title="Image Windows 10")
+        f = Gtk.FileFilter(name="Images ISO")
+        f.add_pattern("*.iso")
+        f.add_pattern("*.ISO")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(f)
+        dialog.set_filters(filters)
+        dialog.set_initial_folder(Gio.File.new_for_path(os.path.expanduser("~/Downloads")))
+
+        def done(d, res):
+            try:
+                path = d.open_finish(res).get_path()
+            except GLib.Error:
+                return
+            self.cfg["iso"] = path
+            save_config(self.cfg)
+            self.update_iso_row()
+            self.update_view()
+
+        dialog.open(self, None, done)
+
+    def download_iso(self):
+        def done(code, output):
+            ok = [l for l in output if l.startswith("OK : ")]
+            if code == 0 and ok:
+                self.cfg["iso"] = ok[-1][5:]
+                save_config(self.cfg)
+                self.update_iso_row()
+                self.update_view()
+                self.toast("Image Windows 10 téléchargée")
+            else:
+                self.toast("Microsoft a refusé le téléchargement automatique", "Ouvrir la page", self.open_ms_page)
+
+        self.run(["iso"], on_done=done)
+
+    def open_ms_page(self):
+        Gtk.UriLauncher.new(WIN10_PAGE).launch(self, None, None)
+        self.toast("Choisis : Windows 10 → Français → 64-bit, puis « Choisir… » pour l'ISO")
+
+    def pick_driver(self):
+        dialog = Gtk.FileDialog(title="Dossier du pilote VMD (contient un fichier .inf)")
+
+        def done(d, res):
+            try:
+                path = d.select_folder_finish(res).get_path()
+            except GLib.Error:
+                return
+            if not glob.glob(os.path.join(path, "*.inf")):
+                self.toast("Ce dossier ne contient aucun fichier .inf")
+                return
+            self.set_driver(path)
+
+        dialog.select_folder(self, None, done)
+
+    def set_driver(self, path):
+        self.cfg["driver"] = path
+        save_config(self.cfg)
+        self.update_driver_row()
+        self.update_view()
+
+    # --- étapes ------------------------------------------------------------------
+
+    def do_prepare(self):
+        st = self.status
+        size = self.cfg["size"]
+        # même règle que la CLI : l'espace non alloué d'abord, la réduction de Linux sinon
+        shrink = size > st.get("free_max_gib", 0)
+        if shrink:
+            body = (f"Linux va être réduit et {size} Gio seront réservés à Windows, plus 8 Gio pour l'installeur.\n\n"
+                    "Btrfs et LUKS sont réduits avant la partition, avec une marge, et chaque étape est vérifiée. "
+                    "Mais une coupure de courant pendant l'opération peut rendre Linux inutilisable : "
+                    "sans sauvegarde, les données seraient perdues. Branche le chargeur.")
+        else:
+            body = (f"{size} Gio d'espace non alloué seront réservés à Windows, plus 8 Gio pour l'installeur.\n\n"
+                    "Aucune partition existante n'est modifiée : trois partitions sont ajoutées dans l'espace libre.")
+        dialog = Adw.AlertDialog(heading="Modifier les partitions ?", body=body)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        group = Adw.PreferencesGroup()
+        confirm = Adw.EntryRow(title="Tape OUI pour confirmer")
+        group.add(confirm)
+        password = None
+        if shrink and st.get("luks"):
+            password = Adw.PasswordEntryRow(title="Passphrase du disque chiffré")
+            group.add(password)
+        box.append(group)
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", "Annuler")
+        dialog.add_response("go", "Préparer le disque")
+        dialog.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_enabled("go", False)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def validate(*_):
+            ok = confirm.get_text() == "OUI" and (password is None or password.get_text() != "")
+            dialog.set_response_enabled("go", ok)
+
+        confirm.connect("changed", validate)
+        if password:
+            password.connect("changed", validate)
+
+        def response(d, res):
+            if d.choose_finish(res) != "go":
+                return
+            argv = ["prepare", "--size", f"{size}G", "--yes"]
+            stdin = None
+            if password:
+                argv.append("--key-stdin")
+                stdin = password.get_text() + "\n"
+
+            def done(code, output):
+                if code == 0:
+                    self.toast("Disque préparé")
+                else:
+                    self.toast("La préparation a échoué : voir le journal")
+
+            self.run(argv, root=True, stdin=stdin, on_done=done)
+
+        dialog.choose(self, None, response)
+
+    def do_stage(self):
+        argv = ["stage", "--iso", self.cfg["iso"]]
+        if self.status.get("vmd") and self.cfg.get("driver"):
+            argv += ["--vmd-driver", self.cfg["driver"]]
+        stdin = None
+        if self.row_auto.get_active():
+            edition = EDITIONS[self.row_edition.get_selected()][0]
+            argv += ["--edition", edition, "--user", self.row_user.get_text(), "--password-stdin"]
+            stdin = self.row_password.get_text() + "\n"
+
+        def done(code, _):
+            if code == 0:
+                # effacé seulement après succès : un nouvel essai garde le même mot de passe
+                self.row_password.set_text("")
+                self.toast("Installeur copié")
+            else:
+                self.toast("La copie a échoué : voir le journal")
+
+        self.run(argv, root=True, stdin=stdin, on_done=done)
+
+    def do_boot(self):
+        if self.status.get("bootnext"):
+            self.confirm_reboot()
+            return
+
+        def done(code, _):
+            if code == 0:
+                self.confirm_reboot()
+            else:
+                self.toast("Échec : voir le journal")
+
+        self.run(["boot"], root=True, on_done=done)
+
+    def ask_install(self, then):
+        update = trusted(INSTALLED_CLI)
+        dialog = Adw.AlertDialog(
+            heading="Mettre à jour l'outil installé" if update else "Installer l'outil d'abord",
+            body=("Les étapes qui modifient le système s'exécutent en root. Pour qu'aucun programme de ta session "
+                  "ne puisse modifier ce qui est lancé en root, l'outil est d'abord copié en root:root dans "
+                  f"{os.path.dirname(INSTALLED_CLI)}.\n\n"
+                  f"Copie depuis :\n{HERE}\n\n"
+                  "Si tu modifies ces fichiers plus tard, relance l'installation."))
+        dialog.add_response("cancel", "Annuler")
+        dialog.add_response("install", "Installer")
+        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+
+        def response(d, res):
+            if d.choose_finish(res) != "install":
+                return
+
+            def done(code, _):
+                if code == 0 and trusted(INSTALLED_CLI):
+                    self.toast("Outil installé")
+                    GLib.idle_add(lambda: then() and False)
+                else:
+                    self.toast("Installation impossible : voir le journal")
+
+            self.run(["install"], root=True, on_done=done, bootstrap=True)
+
+        dialog.choose(self, None, response)
+
+    def confirm_reboot(self):
+        dialog = Adw.AlertDialog(heading="Redémarrer vers l'installeur ?", body=self.install_text())
+        dialog.add_response("later", "Plus tard")
+        dialog.add_response("reboot", "Redémarrer maintenant")
+        dialog.set_response_appearance("reboot", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("later")
+
+        def response(d, res):
+            if d.choose_finish(res) == "reboot":
+                reboot()
+
+        dialog.choose(self, None, response)
+
+    def install_text(self):
+        st = self.status
+        if st.get("unattended"):
+            return ("L'installation est entièrement automatique : ne touche à rien pendant 20 à 40 minutes.\n\n"
+                    "1. L'installeur formate uniquement la partition Windows, après l'avoir identifiée à l'octet près.\n"
+                    "2. Windows crée ton compte local et ouvre une première session tout seul.\n"
+                    f"3. Il redémarre sous Linux, qui finalise au démarrage : Windows apparaît ensuite dans le menu de {st.get('loader_label', '?')}.\n\n"
+                    "Si la partition n'est pas reconnue, l'installeur passe en mode manuel par sécurité : "
+                    f"choisis alors uniquement la partition n°{st.get('win_num') or '?'}.\n"
+                    "Laisse le chargeur branché.")
+        return ("Dans l'installeur Windows :\n"
+                "1. « Je n'ai pas de clé de produit » si tu n'en as pas, puis choisis l'édition.\n"
+                "2. Type d'installation : « Personnalisée ».\n"
+                f"3. Sélectionne UNIQUEMENT « Lecteur 0 Partition {st.get('win_num') or '?'} » "
+                f"({self.cfg.get('size', 100)} Go), clique « Formater » si demandé, puis « Suivant ».\n"
+                "Ne touche à AUCUNE autre partition : elles appartiennent à Linux ou au système.\n"
+                + ("Si aucun disque n'apparaît (Intel VMD) : « Charger un pilote » → Parcourir → "
+                   "WINSETUP\\$WinPEDriver$\\vmd.\n" if st.get("vmd") else "")
+                + "\n"
+                "Une fois Windows installé, reviens sous Linux par le menu de démarrage UEFI "
+                "(F8, F11 ou F12 selon le PC) et ouvre cette application pour finaliser.")
+
+    def show_install_help(self):
+        dialog = Adw.AlertDialog(heading="Installer Windows", body=self.install_text())
+        dialog.add_response("ok", "Compris")
+        dialog.present(self)
+
+    def show_vmd_help(self):
+        dialog = Adw.AlertDialog(
+            heading="Intel VMD et pilote RST",
+            body=("Ton SSD est derrière le contrôleur Intel VMD (RST). L'installeur de Windows 10 n'a pas ce pilote "
+                  "et ne verrait aucun disque.\n\n"
+                  + ("L'étape 2 télécharge donc chez Intel le pilote RST 20.2.6.1025 (iaStorVD, signé WHQL par "
+                     "Microsoft), vérifie ses empreintes et qu'il gère ton contrôleur "
+                     if self.status.get("vmd_rst") else
+                     "L'étape 2 cherche donc le pilote de ton contrôleur dans le catalogue Microsoft Update (signé WHQL), "
+                     "vérifie son empreinte et qu'il le déclare ")
+                  + f"({self.status.get('vmd_ids') or '?'}), puis l'ajoute :\n"
+                  "• à l'installeur, qui le charge avant de chercher le disque ;\n"
+                  "• au Windows installé, pour qu'il démarre ensuite sur ce SSD.\n\n"
+                  "Rien à changer dans le BIOS. « Choisir… » permet d'utiliser un autre pilote F6 (dossier avec iaStorVD.inf)."))
+        dialog.add_response("ok", "Compris")
+        dialog.present(self)
+
+    def do_finish(self):
+        dialog = Adw.AlertDialog(
+            heading="Finaliser ?",
+            body=("Le chargeur de Linux redevient le premier choix au démarrage, la partition WINSETUP est supprimée "
+                  f"et Windows est ajouté au menu de {self.status.get('loader_label', '?')}."))
+        dialog.add_response("cancel", "Annuler")
+        dialog.add_response("go", "Finaliser")
+        dialog.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+
+        def response(d, res):
+            if d.choose_finish(res) == "go":
+                self.run(["finish"], root=True, on_done=lambda code, _: self.toast(
+                    f"Terminé : Windows est dans le menu de {self.status.get('loader_label', '?')}" if code == 0 else "Échec : voir le journal"))
+
+        dialog.choose(self, None, response)
+
+
+    def do_drivers(self):
+        self.run(["drivers"], root=True, on_done=lambda code, _: self.toast(
+            "Copié : sous Windows, lance C:\\linwin\\installer-pilotes.cmd" if code == 0 else "Échec : voir le journal"))
+
+    def do_cancel(self):
+        st = self.status
+        windows = st.get("windows_installed") or st.get("finished")
+        dialog = Adw.AlertDialog(
+            heading="Supprimer Windows ?" if windows else "Annuler l'installation ?",
+            body=(("Windows et TOUT ce qu'il contient seront supprimés, ainsi que ses entrées de démarrage. "
+                   if windows else "Les partitions créées par l'outil seront supprimées. ")
+                  + ("Leur espace est ensuite rendu à Linux (partition, LUKS et Btrfs agrandis à chaud).\n\n"
+                     "Agrandir est moins risqué que réduire, mais garde le chargeur branché."
+                     if st.get("mode") == "shrink" else "Leur espace redevient non alloué ; Linux n'est pas modifié.")))
+        group = Adw.PreferencesGroup()
+        confirm = Adw.EntryRow(title="Tape OUI pour confirmer")
+        group.add(confirm)
+        password = None
+        if st.get("mode") == "shrink" and st.get("luks"):
+            password = Adw.PasswordEntryRow(title="Passphrase du disque chiffré")
+            group.add(password)
+        dialog.set_extra_child(group)
+        dialog.add_response("cancel", "Ne rien faire")
+        dialog.add_response("go", "Supprimer Windows" if windows else "Annuler l'installation")
+        dialog.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_enabled("go", False)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def validate(*_):
+            dialog.set_response_enabled("go", confirm.get_text() == "OUI" and (password is None or password.get_text() != ""))
+
+        confirm.connect("changed", validate)
+        if password:
+            password.connect("changed", validate)
+
+        def response(d, res):
+            if d.choose_finish(res) != "go":
+                return
+            argv = ["cancel", "--yes"]
+            stdin = None
+            if password:
+                argv.append("--key-stdin")
+                stdin = password.get_text() + "\n"
+
+            def done(code, _):
+                if code == 0:
+                    self.toast("Installation annulée")
+                elif code == 3:
+                    self.toast("Redémarre Linux, puis relance l'annulation")
+                else:
+                    self.toast("L'annulation a échoué : voir le journal")
+                # le partitionnement prévu a changé
+                self.plan_label.set_label("")
+                self.on_size_changed()
+
+            self.run(argv, root=True, stdin=stdin, on_done=done)
+
+        dialog.choose(self, None, response)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.get_active_window() or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    if not ADW_OK:
+        version = f"{Adw.get_major_version()}.{Adw.get_minor_version()}"
+        msg = (f"linwin-gui demande libadwaita 1.5 ou plus récent (installé : {version}).\n"
+               f"Utilise la ligne de commande : {LOCAL_CLI} --help")
+        print(msg, file=sys.stderr)
+        if GLib.find_program_in_path("notify-send"):
+            subprocess.run(["notify-send", "linwin", msg])
+        sys.exit(1)
+    sys.exit(App().run(sys.argv))
