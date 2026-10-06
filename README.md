@@ -1,6 +1,20 @@
 # linwin v1
 
+[![Licence GPL-3.0](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
+[![Version v1](https://img.shields.io/github/v/release/2Deathadder/linwin?label=version)](https://github.com/2Deathadder/linwin/releases/tag/v1)
+[![Site](https://img.shields.io/badge/site-2deathadder.github.io%2Flinwin-informational)](https://2deathadder.github.io/linwin/)
+
 **Installer Windows 10 à côté de Linux, en dual-boot natif, sans clé USB.**
+
+> **English** — linwin installs **Windows 10 as a native dual-boot from Linux,
+> without a USB drive**. It creates the partitions in unallocated space (or
+> shrinks a Btrfs root online), copies the installer to a temporary partition that
+> replaces the USB stick, installs Windows **unattended**, adds the **Intel RST/VMD**
+> and **Wi-Fi/Ethernet drivers**, then adds Windows to **GRUB, systemd-boot, Limine
+> or rEFInd**. Works on any distribution (Ubuntu, Debian, Fedora, Arch, openSUSE…).
+> Quick start: `git clone https://github.com/2Deathadder/linwin.git && cd linwin &&
+> sudo ./linwin install && linwin check`. English overview:
+> <https://2deathadder.github.io/linwin/en/>. The manual below is in French.
 
 linwin fait de la place sur le disque, y copie l'installeur Windows, démarre
 dessus une seule fois, puis remet Linux en premier et ajoute Windows au menu de

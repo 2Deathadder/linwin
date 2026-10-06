@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>linwin — installer Windows 10 en dual-boot depuis Linux, sans clé USB</title>
+<meta name="description" content="linwin installe Windows 10 à côté de Linux sans clé USB : partitionnement automatique, installation sans intervention, pilotes Wi-Fi et Intel RST ajoutés, GRUB, systemd-boot et Limine. Libre (GPL-3.0), toutes distributions.">
+<meta name="keywords" content="dual boot Linux Windows, installer Windows depuis Linux, Windows 10 sans clé USB, dual-boot sans USB, GRUB Windows, systemd-boot Windows, Limine Windows, Btrfs, Intel RST VMD, WinPE, unattend">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="fr_FR">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="linwin — Windows 10 en dual-boot depuis Linux, sans clé USB">
+<meta property="og:description" content="Installe Windows 10 à côté de Linux sans clé USB : installation automatique, pilotes ajoutés, toutes distributions.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="linwin — Windows 10 en dual-boot depuis Linux, sans clé USB">
+<meta name="twitter:description" content="Installe Windows 10 à côté de Linux sans clé USB, automatiquement.">
+<meta name="twitter:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://2deathadder.github.io/linwin/#app",
+      "name": "linwin",
+      "alternateName": "linwin v1",
+      "description": "Outil libre qui installe Windows 10 en dual-boot natif depuis Linux, sans clé USB : il crée les partitions dans l'espace libre (ou réduit une racine Btrfs à chaud), copie l'installeur sur une petite partition qui remplace la clé USB, démarre dessus une fois, installe Windows sans intervention, puis ajoute Windows au menu de GRUB, systemd-boot, Limine ou rEFInd.",
+      "applicationCategory": "UtilitiesApplication",
+      "applicationSubCategory": "Dual-boot installer",
+      "operatingSystem": "Linux (x86-64, UEFI)",
+      "softwareVersion": "1",
+      "datePublished": "2026-10-06",
+      "inLanguage": ["fr", "en"],
+      "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" },
+      "url": "https://2deathadder.github.io/linwin/",
+      "downloadUrl": "https://github.com/2Deathadder/linwin/releases/tag/v1",
+      "codeRepository": "https://github.com/2Deathadder/linwin",
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "author": { "@type": "Person", "name": "2Deathadder", "url": "https://github.com/2Deathadder" },
+      "featureList": [
+        "Installation de Windows 10 sans clé USB depuis Linux",
+        "Installation sans intervention avec retour automatique sous Linux",
+        "Partitions créées dans l'espace non alloué, ou réduction à chaud de Btrfs (LUKS compris)",
+        "Pilote Intel RST VMD ajouté pour que l'installeur voie le SSD",
+        "Pilotes Wi-Fi et Ethernet du catalogue Microsoft Update",
+        "Prise en charge de GRUB, systemd-boot, Limine et rEFInd",
+        "Toutes distributions : apt, dnf, pacman, zypper, xbps, apk, emerge",
+        "Annulation possible à toute étape"
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Peut-on installer Windows 10 depuis Linux sans clé USB ?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Oui. linwin crée une petite partition FAT32 qui joue le rôle de la clé USB, y copie l'ISO de Windows 10 et programme un démarrage unique dessus. Aucune clé USB ni DVD n'est nécessaire." }
+        },
+        {
+          "@type": "Question",
+          "name": "linwin efface-t-il Linux ?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Non. linwin utilise l'espace non alloué du disque, ou réduit à chaud une racine Btrfs avec des vérifications à chaque étape. L'installeur Windows ne peut écrire que sur la partition prévue. Une sauvegarde reste recommandée." }
+        },
+        {
+          "@type": "Question",
+          "name": "Quelles distributions Linux sont compatibles ?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Toutes les distributions courantes sur PC x86-64 en UEFI : Ubuntu, Debian, Linux Mint, Fedora, Arch, Manjaro, openSUSE, Void, Alpine, Gentoo… Les outils manquants s'installent automatiquement." }
+        },
+        {
+          "@type": "Question",
+          "name": "L'installeur Windows 10 ne voit pas le SSD (Intel VMD/RST), que faire ?",
+          "acceptedAnswer": { "@type": "Answer", "text": "linwin détecte Intel VMD et ajoute automatiquement le pilote Intel RST (ou celui du catalogue Microsoft Update) à l'installeur. Rien à changer dans le BIOS." }
+        },
+        {
+          "@type": "Question",
+          "name": "Le Wi-Fi fonctionnera-t-il sous Windows après l'installation ?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Oui : pour chaque carte Wi-Fi ou Ethernet, linwin ajoute le pilote Windows 10 du catalogue Microsoft Update (Intel, MediaTek, Realtek…). Windows a donc le réseau dès le premier démarrage." }
+        },
+        {
+          "@type": "Question",
+          "name": "Comment désinstaller Windows ensuite ?",
+          "acceptedAnswer": { "@type": "Answer", "text": "La commande « linwin cancel » supprime Windows, ses entrées de démarrage et ses partitions, puis rend l'espace à Linux. Elle fonctionne à n'importe quelle étape." }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="./">linwin</a>
+    <nav>
+      <a href="#fonctions">Fonctions</a>
+      <a href="#installation">Installation</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manuel</a>
+      <a href="en/" hreflang="en" lang="en">English</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <div class="badges"><span class="badge l">Linux</span><span class="badge w">Windows 10</span></div>
+      <h1>Installer Windows 10 en dual-boot depuis Linux, sans clé USB</h1>
+      <p class="lead">linwin fait la place sur le disque, copie l'installeur, démarre dessus une seule fois et installe Windows
+        <strong>sans intervention</strong>. Il revient ensuite sous Linux et ajoute Windows au menu de démarrage.
+        Libre, pour toutes les distributions.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Télécharger la v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin#readme">Lire le manuel</a>
+      </div>
+    </div>
+
+    <section id="fonctions">
+      <h2>Ce que fait linwin</h2>
+      <div class="grid">
+        <div class="card"><h3>Sans clé USB</h3><p>Une partition FAT32 temporaire remplace la clé USB. Elle est supprimée à la fin et son espace rendu à Windows.</p></div>
+        <div class="card"><h3>Zéro intervention</h3><p>Windows s'installe, crée ton compte local et redémarre sous Linux, qui finalise tout seul.</p></div>
+        <div class="card"><h3>Linux préservé</h3><p>Partitions créées dans l'espace libre, ou réduction à chaud d'une racine Btrfs (même chiffrée LUKS). Chaque étape est vérifiée.</p></div>
+        <div class="card"><h3>Pilotes ajoutés</h3><p>Intel RST/VMD pour que l'installeur voie le SSD, pilotes Wi-Fi et Ethernet du catalogue Microsoft Update.</p></div>
+        <div class="card"><h3>Ton chargeur</h3><p>Windows ajouté au menu de GRUB, systemd-boot, Limine ou rEFInd ; Linux reste le choix par défaut.</p></div>
+        <div class="card"><h3>Réversible</h3><p><code>linwin cancel</code> retire Windows à n'importe quelle étape et rend l'espace à Linux.</p></div>
+      </div>
+    </section>
+
+    <section id="installation">
+      <h2>Installation</h2>
+      <pre><code>git clone https://github.com/2Deathadder/linwin.git
+cd linwin
+sudo ./linwin install
+linwin check</code></pre>
+      <p>Puis lance <strong>linwin</strong> depuis le menu des applications, ou en ligne de commande :</p>
+      <ol class="steps">
+        <li><code>sudo linwin prepare --size 100G</code> — crée les partitions de Windows</li>
+        <li><code>sudo linwin stage --iso Win10.iso --edition Home --user moi</code> — copie l'installeur</li>
+        <li><code>sudo linwin boot</code> puis redémarre — Windows s'installe tout seul</li>
+        <li>Au retour sous Linux, linwin finalise (Windows apparaît dans le menu de démarrage)</li>
+      </ol>
+      <p class="warn">Sauvegarde tes données et garde le chargeur branché : linwin modifie la table de partitions.</p>
+    </section>
+
+    <section id="compatibilite">
+      <h2>Compatibilité</h2>
+      <div class="table-scroll">
+      <table>
+        <tr><th>PC</th><td>x86-64, démarrage UEFI 64 bits, disque GPT</td></tr>
+        <tr><th>Distributions</th><td>Ubuntu, Debian, Mint, Fedora, Arch, Manjaro, openSUSE, Void, Alpine, Gentoo… (apt, dnf, pacman, zypper, xbps, apk, emerge)</td></tr>
+        <tr><th>Chargeurs</th><td>GRUB, systemd-boot, Limine, rEFInd</td></tr>
+        <tr><th>Init</th><td>systemd, OpenRC</td></tr>
+        <tr><th>Place pour Windows</th><td>espace non alloué (tout système de fichiers) ou racine Btrfs réduite à chaud</td></tr>
+        <tr><th>Interface</th><td>GTK 4 + libadwaita 1.5+ ; ligne de commande partout</td></tr>
+      </table>
+      </div>
+    </section>
+
+    <section id="faq">
+      <h2>Questions fréquentes</h2>
+      <details><summary>Peut-on installer Windows 10 depuis Linux sans clé USB ?</summary>
+        <p>Oui. linwin crée une petite partition FAT32 qui joue le rôle de la clé USB, y copie l'ISO de Windows 10 et programme un démarrage unique dessus.</p></details>
+      <details><summary>linwin efface-t-il Linux ?</summary>
+        <p>Non. Il utilise l'espace non alloué, ou réduit une racine Btrfs avec des vérifications à chaque étape, et l'installeur ne peut écrire que sur la partition prévue. Une sauvegarde reste recommandée.</p></details>
+      <details><summary>Ma racine est en ext4 : est-ce possible ?</summary>
+        <p>Oui, s'il y a assez d'espace non alloué sur le disque. ext4 et XFS ne se réduisent pas pendant que Linux tourne : libère d'abord de l'espace (par exemple avec GParted depuis un système live).</p></details>
+      <details><summary>L'installeur Windows ne voit pas mon SSD (Intel VMD/RST)</summary>
+        <p>linwin détecte Intel VMD et ajoute automatiquement le pilote Intel RST à l'installeur. Rien à changer dans le BIOS.</p></details>
+      <details><summary>Aurai-je le Wi-Fi sous Windows ?</summary>
+        <p>Oui : linwin ajoute le pilote Windows 10 de chaque carte Wi-Fi et Ethernet depuis le catalogue Microsoft Update (Intel, MediaTek, Realtek…).</p></details>
+      <details><summary>Comment retirer Windows ensuite ?</summary>
+        <p><code>sudo linwin cancel</code> supprime Windows, ses entrées de démarrage et ses partitions, puis rend l'espace à Linux.</p></details>
+    </section>
+  </main>
+
+  <footer>
+    linwin v1 — logiciel libre sous licence <a href="https://github.com/2Deathadder/linwin/blob/main/LICENSE">GPL-3.0</a>,
+    par <a href="https://github.com/2Deathadder">2Deathadder</a>.
+    Code source : <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a>.
+    linwin n'est affilié ni à Microsoft ni à Intel.
+  </footer>
+</div>
+</body>
+</html>

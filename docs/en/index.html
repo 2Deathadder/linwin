@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>linwin — install Windows 10 dual-boot from Linux, no USB drive</title>
+<meta name="description" content="linwin installs Windows 10 alongside Linux without a USB stick: automatic partitioning, unattended setup, Wi-Fi and Intel RST drivers included, GRUB, systemd-boot and Limine support. Free software (GPL-3.0), any distribution.">
+<meta name="keywords" content="dual boot Linux Windows, install Windows from Linux, Windows 10 without USB, dual-boot without USB stick, GRUB Windows entry, systemd-boot Windows, Limine Windows, Btrfs shrink, Intel RST VMD driver, WinPE, unattended install">
+<link rel="canonical" href="https://2deathadder.github.io/linwin/en/">
+<link rel="alternate" hreflang="fr" href="https://2deathadder.github.io/linwin/">
+<link rel="alternate" hreflang="en" href="https://2deathadder.github.io/linwin/en/">
+<link rel="alternate" hreflang="x-default" href="https://2deathadder.github.io/linwin/en/">
+<meta name="robots" content="index, follow">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="linwin">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="fr_FR">
+<meta property="og:title" content="linwin — Windows 10 dual-boot from Linux, no USB drive">
+<meta property="og:description" content="Install Windows 10 alongside Linux without a USB stick: unattended setup, drivers included, any distribution.">
+<meta property="og:url" content="https://2deathadder.github.io/linwin/en/">
+<meta property="og:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="linwin — Windows 10 dual-boot from Linux, no USB drive">
+<meta name="twitter:description" content="Install Windows 10 alongside Linux without a USB stick, unattended.">
+<meta name="twitter:image" content="https://2deathadder.github.io/linwin/og.png">
+<meta name="theme-color" content="#0f1724">
+<link rel="stylesheet" href="../style.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://2deathadder.github.io/linwin/#app",
+      "name": "linwin",
+      "alternateName": "linwin v1",
+      "description": "Free tool that installs Windows 10 as a native dual-boot from Linux without a USB drive: it creates the partitions in unallocated space (or shrinks a Btrfs root online), copies the installer to a small partition that replaces the USB stick, boots it once, installs Windows unattended, then adds Windows to the GRUB, systemd-boot, Limine or rEFInd menu.",
+      "applicationCategory": "UtilitiesApplication",
+      "applicationSubCategory": "Dual-boot installer",
+      "operatingSystem": "Linux (x86-64, UEFI)",
+      "softwareVersion": "1",
+      "datePublished": "2026-10-06",
+      "inLanguage": ["fr", "en"],
+      "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "url": "https://2deathadder.github.io/linwin/en/",
+      "downloadUrl": "https://github.com/2Deathadder/linwin/releases/tag/v1",
+      "codeRepository": "https://github.com/2Deathadder/linwin",
+      "image": "https://2deathadder.github.io/linwin/og.png",
+      "author": { "@type": "Person", "name": "2Deathadder", "url": "https://github.com/2Deathadder" },
+      "featureList": [
+        "Install Windows 10 from Linux without a USB drive",
+        "Unattended installation with automatic return to Linux",
+        "Partitions created in unallocated space, or online Btrfs shrink (LUKS supported)",
+        "Intel RST VMD driver added so the installer sees the SSD",
+        "Wi-Fi and Ethernet drivers from the Microsoft Update Catalog",
+        "GRUB, systemd-boot, Limine and rEFInd support",
+        "Any distribution: apt, dnf, pacman, zypper, xbps, apk, emerge",
+        "Can be undone at any step"
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Can I install Windows 10 from Linux without a USB drive?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. linwin creates a small FAT32 partition that acts as the USB stick, copies the Windows 10 ISO to it and schedules a one-time boot. No USB drive or DVD is needed." }
+        },
+        {
+          "@type": "Question",
+          "name": "Will linwin erase Linux?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. linwin uses unallocated disk space, or shrinks a Btrfs root online with checks at every step. The Windows installer may only write to the planned partition. A backup is still recommended." }
+        },
+        {
+          "@type": "Question",
+          "name": "Which Linux distributions are supported?",
+          "acceptedAnswer": { "@type": "Answer", "text": "All common distributions on x86-64 UEFI PCs: Ubuntu, Debian, Linux Mint, Fedora, Arch, Manjaro, openSUSE, Void, Alpine, Gentoo… Missing tools are installed automatically." }
+        },
+        {
+          "@type": "Question",
+          "name": "The Windows 10 installer does not see my SSD (Intel VMD/RST). What can I do?",
+          "acceptedAnswer": { "@type": "Answer", "text": "linwin detects Intel VMD and automatically adds the Intel RST driver (or the one from the Microsoft Update Catalog) to the installer. No BIOS change is needed." }
+        },
+        {
+          "@type": "Question",
+          "name": "Will Wi-Fi work in Windows after installation?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes: for every Wi-Fi or Ethernet card, linwin adds the Windows 10 driver from the Microsoft Update Catalog (Intel, MediaTek, Realtek…), so Windows has network access on first boot." }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I remove Windows afterwards?",
+          "acceptedAnswer": { "@type": "Answer", "text": "The command “linwin cancel” removes Windows, its boot entries and its partitions, then gives the space back to Linux. It works at any step." }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="./">linwin</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/2Deathadder/linwin#readme">Manual (French)</a>
+      <a href="../" hreflang="fr" lang="fr">Français</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <div class="badges"><span class="badge l">Linux</span><span class="badge w">Windows 10</span></div>
+      <h1>Install Windows 10 as a dual-boot from Linux, without a USB drive</h1>
+      <p class="lead">linwin makes room on the disk, copies the installer, boots it once and installs Windows
+        <strong>unattended</strong>. It then comes back to Linux and adds Windows to your boot menu.
+        Free software, for any distribution.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/2Deathadder/linwin/releases/tag/v1">Download v1</a>
+        <a class="btn ghost" href="https://github.com/2Deathadder/linwin">Source code</a>
+      </div>
+    </div>
+
+    <section id="features">
+      <h2>What linwin does</h2>
+      <div class="grid">
+        <div class="card"><h3>No USB stick</h3><p>A temporary FAT32 partition replaces the USB drive. It is deleted at the end and its space goes to Windows.</p></div>
+        <div class="card"><h3>Zero interaction</h3><p>Windows installs itself, creates your local account and reboots into Linux, which finishes the job.</p></div>
+        <div class="card"><h3>Linux stays safe</h3><p>Partitions go into free space, or a Btrfs root (even LUKS-encrypted) is shrunk online. Every step is verified.</p></div>
+        <div class="card"><h3>Drivers included</h3><p>Intel RST/VMD so the installer sees the SSD, plus Wi-Fi and Ethernet drivers from the Microsoft Update Catalog.</p></div>
+        <div class="card"><h3>Your boot loader</h3><p>Windows is added to GRUB, systemd-boot, Limine or rEFInd; Linux stays the default.</p></div>
+        <div class="card"><h3>Reversible</h3><p><code>linwin cancel</code> removes Windows at any step and gives the space back to Linux.</p></div>
+      </div>
+    </section>
+
+    <section id="install">
+      <h2>Install</h2>
+      <pre><code>git clone https://github.com/2Deathadder/linwin.git
+cd linwin
+sudo ./linwin install
+linwin check</code></pre>
+      <p>Then open <strong>linwin</strong> from your application menu, or use the command line:</p>
+      <ol class="steps">
+        <li><code>sudo linwin prepare --size 100G</code> — creates the Windows partitions</li>
+        <li><code>sudo linwin stage --iso Win10.iso --edition Home --user me</code> — copies the installer</li>
+        <li><code>sudo linwin boot</code> and reboot — Windows installs itself</li>
+        <li>Back in Linux, linwin finishes (Windows appears in the boot menu)</li>
+      </ol>
+      <p class="warn">Back up your data and keep the charger plugged in: linwin edits the partition table. The interface and messages are in French.</p>
+    </section>
+
+    <section id="compatibility">
+      <h2>Compatibility</h2>
+      <div class="table-scroll">
+      <table>
+        <tr><th>PC</th><td>x86-64, 64-bit UEFI boot, GPT disk</td></tr>
+        <tr><th>Distributions</th><td>Ubuntu, Debian, Mint, Fedora, Arch, Manjaro, openSUSE, Void, Alpine, Gentoo… (apt, dnf, pacman, zypper, xbps, apk, emerge)</td></tr>
+        <tr><th>Boot loaders</th><td>GRUB, systemd-boot, Limine, rEFInd</td></tr>
+        <tr><th>Init</th><td>systemd, OpenRC</td></tr>
+        <tr><th>Space for Windows</th><td>unallocated space (any filesystem) or a Btrfs root shrunk online</td></tr>
+        <tr><th>Interface</th><td>GTK 4 + libadwaita 1.5+; command line everywhere</td></tr>
+      </table>
+      </div>
+    </section>
+
+    <section id="faq">
+      <h2>FAQ</h2>
+      <details><summary>Can I install Windows 10 from Linux without a USB drive?</summary>
+        <p>Yes. linwin creates a small FAT32 partition that acts as the USB stick, copies the Windows 10 ISO to it and schedules a one-time boot.</p></details>
+      <details><summary>Will linwin erase Linux?</summary>
+        <p>No. It uses unallocated space, or shrinks a Btrfs root with checks at every step, and the installer may only write to the planned partition. A backup is still recommended.</p></details>
+      <details><summary>My root filesystem is ext4. Is it possible?</summary>
+        <p>Yes, if the disk has enough unallocated space. ext4 and XFS cannot be shrunk while Linux is running: free some space first (for example with GParted from a live system).</p></details>
+      <details><summary>The Windows installer does not see my SSD (Intel VMD/RST)</summary>
+        <p>linwin detects Intel VMD and adds the Intel RST driver to the installer automatically. No BIOS change is needed.</p></details>
+      <details><summary>Will Wi-Fi work in Windows?</summary>
+        <p>Yes: linwin adds the Windows 10 driver for each Wi-Fi and Ethernet card from the Microsoft Update Catalog (Intel, MediaTek, Realtek…).</p></details>
+      <details><summary>How do I remove Windows later?</summary>
+        <p><code>sudo linwin cancel</code> removes Windows, its boot entries and partitions, then gives the space back to Linux.</p></details>
+    </section>
+  </main>
+
+  <footer>
+    linwin v1 — free software under the <a href="https://github.com/2Deathadder/linwin/blob/main/LICENSE">GPL-3.0</a> license,
+    by <a href="https://github.com/2Deathadder">2Deathadder</a>.
+    Source: <a href="https://github.com/2Deathadder/linwin">github.com/2Deathadder/linwin</a>.
+    linwin is not affiliated with Microsoft or Intel.
+  </footer>
+</div>
+</body>
+</html>

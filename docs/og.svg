@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1724"/>
+      <stop offset="1" stop-color="#1b2a41"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <!-- deux partitions côte à côte : Linux | Windows -->
+  <g transform="translate(80,96)">
+    <rect width="300" height="64" rx="12" fill="#f4b942"/>
+    <text x="150" y="42" font-family="Noto Sans" font-weight="700" font-size="28" fill="#1b1b1b" text-anchor="middle">Linux</text>
+    <rect x="316" width="220" height="64" rx="12" fill="#3b82f6"/>
+    <text x="426" y="42" font-family="Noto Sans" font-weight="700" font-size="28" fill="#ffffff" text-anchor="middle">Windows 10</text>
+  </g>
+  <text x="80" y="300" font-family="Noto Sans" font-weight="800" font-size="104" fill="#ffffff">linwin</text>
+  <text x="80" y="372" font-family="Noto Sans" font-weight="500" font-size="40" fill="#dbe4f0">Windows 10 en dual-boot depuis Linux,</text>
+  <text x="80" y="422" font-family="Noto Sans" font-weight="500" font-size="40" fill="#dbe4f0">sans clé USB</text>
+  <text x="80" y="510" font-family="Noto Sans" font-size="27" fill="#93a4bb">Installation automatique · toutes distributions · GRUB, systemd-boot, Limine</text>
+  <text x="80" y="560" font-family="Noto Sans" font-size="27" fill="#f4b942">github.com/2Deathadder/linwin</text>
+</svg>
