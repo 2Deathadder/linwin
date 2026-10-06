@@ -470,6 +470,8 @@ def page(lang, path, depth, title, desc, h1, body, crumbs, article=True):
 <meta property="og:image" content="{BASE}og.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#0f1724">
+<link rel="icon" href="{BASE}logo.svg" type="image/svg+xml">
+<link rel="icon" href="{BASE}logo-192.png" sizes="192x192" type="image/png">
 <link rel="stylesheet" href="{css}">
 <script type="application/ld+json">
 {ld}
